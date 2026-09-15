@@ -21,12 +21,15 @@ type BashResultRenderState = {
 	cachedWidth: number | undefined;
 	cachedLines: string[] | undefined;
 	cachedSkipped: number | undefined;
+	/** Fully assembled array (including the "earlier lines" hint) returned to the caller, keyed by cachedWidth. */
+	cachedResult: string[] | undefined;
 };
 class BashResultRenderComponent extends Container {
 	state: BashResultRenderState = {
 		cachedWidth: undefined,
 		cachedLines: undefined,
 		cachedSkipped: undefined,
+		cachedResult: undefined,
 	};
 }
 function formatDuration(ms: number): string {
@@ -74,24 +77,33 @@ function rebuildBashResultRenderComponent(
 		} else {
 			component.addChild({
 				render: (width: number) => {
-					if (state.cachedLines === undefined || state.cachedWidth !== width) {
-						const preview = truncateToVisualLines(styledOutput, BASH_PREVIEW_LINES, width);
-						state.cachedLines = preview.visualLines;
-						state.cachedSkipped = preview.skippedCount;
-						state.cachedWidth = width;
+					// The fully assembled array (including the "earlier lines" hint) is memoized by
+					// width. This must return the identical array reference on a cache hit so that
+					// ancestor Containers can skip re-concatenating their own rendered output.
+					if (state.cachedResult !== undefined && state.cachedWidth === width) {
+						return state.cachedResult;
 					}
-					if (state.cachedSkipped && state.cachedSkipped > 0) {
+					const preview = truncateToVisualLines(styledOutput, BASH_PREVIEW_LINES, width);
+					state.cachedLines = preview.visualLines;
+					state.cachedSkipped = preview.skippedCount;
+					state.cachedWidth = width;
+					let result: string[];
+					if (state.cachedSkipped > 0) {
 						const hint =
 							theme.fg("muted", `... (${state.cachedSkipped} earlier lines,`) +
 							` ${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`;
-						return ["", truncateToWidth(hint, width, "..."), ...(state.cachedLines ?? [])];
+						result = ["", truncateToWidth(hint, width, "..."), ...state.cachedLines];
+					} else {
+						result = ["", ...state.cachedLines];
 					}
-					return ["", ...(state.cachedLines ?? [])];
+					state.cachedResult = result;
+					return result;
 				},
 				invalidate: () => {
 					state.cachedWidth = undefined;
 					state.cachedLines = undefined;
 					state.cachedSkipped = undefined;
+					state.cachedResult = undefined;
 				},
 			});
 		}
