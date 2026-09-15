@@ -319,6 +319,11 @@ type OverlayFocusRestorePolicy = "clear" | "preserve";
 export class Container implements Component {
 	children: Component[] = [];
 	private mouseLayout?: { width: number; children: Array<{ component: Component; height: number }> };
+	/** Concatenation cache: valid when `render()` is called again at the same width and every
+	 *  child returns the exact same (reference-equal) lines array it returned last time. */
+	private cachedWidth?: number;
+	private cachedChildLines?: string[][];
+	private cachedLines?: string[];
 
 	addChild(component: Component): void {
 		this.children.push(component);
@@ -333,9 +338,17 @@ export class Container implements Component {
 
 	clear(): void {
 		this.children = [];
+		this.invalidateConcatCache();
+	}
+
+	private invalidateConcatCache(): void {
+		this.cachedWidth = undefined;
+		this.cachedChildLines = undefined;
+		this.cachedLines = undefined;
 	}
 
 	invalidate(): void {
+		this.invalidateConcatCache();
 		for (const child of this.children) {
 			child.invalidate?.();
 		}
@@ -364,16 +377,42 @@ export class Container implements Component {
 	}
 
 	render(width: number): string[] {
-		const lines: string[] = [];
 		const mouseChildren: Array<{ component: Component; height: number }> = [];
-		for (const child of this.children) {
+		const childLinesList: string[][] = new Array(this.children.length);
+		// A cache hit requires every child to return the identical array reference it returned
+		// last frame at this width: unchanged leaves (Text, Markdown, Box, cached tool renderers)
+		// already do this, so a cheap reference check here lets an unchanged subtree skip the
+		// O(total lines) concatenation entirely. Children are still rendered - this only saves the
+		// recomposition of already-rendered output - so a child that always allocates a fresh
+		// array is still correct, just always a cache miss.
+		let cacheHit =
+			this.cachedLines !== undefined &&
+			this.cachedWidth === width &&
+			this.cachedChildLines !== undefined &&
+			this.cachedChildLines.length === this.children.length;
+		for (let i = 0; i < this.children.length; i++) {
+			const child = this.children[i];
 			const childLines = child.render(width);
+			childLinesList[i] = childLines;
 			mouseChildren.push({ component: child, height: childLines.length });
+			if (cacheHit && this.cachedChildLines![i] !== childLines) {
+				cacheHit = false;
+			}
+		}
+		this.mouseLayout = { width, children: mouseChildren };
+		if (cacheHit) {
+			return this.cachedLines!;
+		}
+
+		const lines: string[] = [];
+		for (const childLines of childLinesList) {
 			for (const line of childLines) {
 				lines.push(line);
 			}
 		}
-		this.mouseLayout = { width, children: mouseChildren };
+		this.cachedWidth = width;
+		this.cachedChildLines = childLinesList;
+		this.cachedLines = lines;
 		return lines;
 	}
 }
@@ -1350,13 +1389,19 @@ export abstract class TuiBase extends Container implements TUI {
 		return result;
 	}
 
+	/**
+	 * Reset a single line for terminal output: normalize it and append a style/hyperlink reset
+	 * so a line's styling never bleeds into the next. Pure per-line transform (no cross-line
+	 * state), so it is safe to apply to a subset of lines rather than a whole buffer. Image lines
+	 * are left untouched (resetting would corrupt the escape sequence).
+	 */
+	protected resetLine(line: string): string {
+		return isImageLine(line) ? line : normalizeTerminalOutput(line) + SEGMENT_RESET;
+	}
+
 	protected applyLineResets(lines: string[]): string[] {
-		const reset = SEGMENT_RESET;
 		for (let i = 0; i < lines.length; i++) {
-			const line = lines[i];
-			if (!isImageLine(line)) {
-				lines[i] = normalizeTerminalOutput(line) + reset;
-			}
+			lines[i] = this.resetLine(lines[i]);
 		}
 		return lines;
 	}

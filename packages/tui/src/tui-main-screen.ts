@@ -175,10 +175,12 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		this.terminal.write("\r\n");
 	}
 
-	private collectKittyImageIds(lines: string[]): Set<number> {
+	/** Collect kitty image ids from `lines[from..to]` (inclusive), clamped to the array bounds. */
+	private collectKittyImageIds(lines: string[], from = 0, to = lines.length - 1): Set<number> {
 		const ids = new Set<number>();
-		for (const line of lines) {
-			for (const id of extractKittyImageIds(line)) {
+		const end = Math.min(to, lines.length - 1);
+		for (let i = Math.max(0, from); i <= end; i++) {
+			for (const id of extractKittyImageIds(lines[i])) {
 				ids.add(id);
 			}
 		}
@@ -214,8 +216,9 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	): { firstChanged: number; lastChanged: number } {
 		let expandedFirstChanged = firstChanged;
 		let expandedLastChanged = lastChanged;
-		const expandForLines = (lines: string[]): void => {
-			for (let i = 0; i < lines.length; i++) {
+		const expandForLines = (lines: string[], from: number, to: number): void => {
+			const end = Math.min(to, lines.length - 1);
+			for (let i = Math.max(0, from); i <= end; i++) {
 				if (extractKittyImageIds(lines[i]).length === 0) continue;
 				const blockEnd = i + this.getKittyImageReservedRows(lines, i) - 1;
 				if (i >= firstChanged || (i <= lastChanged && blockEnd >= firstChanged)) {
@@ -225,8 +228,20 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			}
 		};
 
-		expandForLines(this.previousLines);
-		expandForLines(newLines);
+		// `this.previousLines` are the lines diffed to compute [firstChanged, lastChanged]: any
+		// index outside that range is, by construction, identical between previousLines and
+		// newLines. So if the previous frame had no kitty images anywhere (tracked incrementally
+		// in `previousKittyImageIds`, collected via the same extractKittyImageIds() used below),
+		// no unchanged line can suddenly contain one now, and no line in previousLines can either.
+		// Only the changed range of newLines can newly introduce an image, so the scan is bounded
+		// to it instead of the entire scrollback. When images are already present, fall back to
+		// scanning both arrays in full, matching the original behavior exactly.
+		if (this.previousKittyImageIds.size === 0) {
+			expandForLines(newLines, firstChanged, lastChanged);
+		} else {
+			expandForLines(this.previousLines, 0, this.previousLines.length - 1);
+			expandForLines(newLines, 0, newLines.length - 1);
+		}
 		return { firstChanged: expandedFirstChanged, lastChanged: expandedLastChanged };
 	}
 
@@ -271,7 +286,14 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		// Extract cursor position before applying line resets (marker must be found first)
 		const cursorPos = this.extractCursorPosition(newLines, height);
 
-		newLines = this.applyLineResets(newLines);
+		// Line resets (isImageLine + normalizeTerminalOutput) are deferred until we know which
+		// lines are actually written: a full render needs every line, a differential render only
+		// needs the changed range. `newLines` therefore stays raw (as produced by `render()`) all
+		// the way through diffing and is what gets stored in `this.previousLines`, so the next
+		// frame's diff also compares raw-to-raw. `resetLine()` is applied per line at write time.
+		// This is safe because reset is a pure per-line transform with no cross-line ANSI state:
+		// it only normalizes the line's own content and appends a fixed reset sequence, so
+		// resetting an arbitrary subset of lines produces the same bytes as resetting all of them.
 
 		// Helper to clear scrollback and viewport and render all new lines
 		const fullRender = (clear: boolean): void => {
@@ -284,8 +306,9 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			}
 			for (let i = 0; i < newLines.length; i++) {
 				if (i > 0) output.append("\r\n");
-				const line = newLines[i];
-				const isImage = isImageLine(line);
+				const rawLine = newLines[i];
+				const isImage = isImageLine(rawLine);
+				const line = isImage ? rawLine : this.resetLine(rawLine);
 				const imageReservedRows = isImage ? this.getKittyImageReservedRows(newLines, i) : 1;
 				if (imageReservedRows > 1 && imageReservedRows <= height) {
 					for (let row = 1; row < imageReservedRows; row++) {
@@ -439,7 +462,10 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			}
 			this.positionHardwareCursor(cursorPos, newLines.length);
 			this.previousLines = newLines;
-			this.previousKittyImageIds = this.collectKittyImageIds(newLines);
+			// `newLines` here is a strict prefix of the previous frame's lines (only a tail was
+			// deleted), so if no images existed before, none can exist now either.
+			this.previousKittyImageIds =
+				this.previousKittyImageIds.size === 0 ? new Set() : this.collectKittyImageIds(newLines);
 			this.previousWidth = width;
 			this.previousHeight = height;
 			this.previousViewportTop = prevViewportTop;
@@ -489,8 +515,9 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		const renderEnd = Math.min(lastChanged, newLines.length - 1);
 		for (let i = firstChanged; i <= renderEnd; i++) {
 			if (i > firstChanged) output.append("\r\n");
-			const line = newLines[i];
-			const isImage = isImageLine(line);
+			const rawLine = newLines[i];
+			const isImage = isImageLine(rawLine);
+			const line = isImage ? rawLine : this.resetLine(rawLine);
 			const imageReservedRows = isImage ? this.getKittyImageReservedRows(newLines, i, renderEnd) : 1;
 			if (imageReservedRows > 1) {
 				const imageStartScreenRow = i - viewportTop;
@@ -610,7 +637,14 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		this.positionHardwareCursor(cursorPos, newLines.length);
 
 		this.previousLines = newLines;
-		this.previousKittyImageIds = this.collectKittyImageIds(newLines);
+		// Lines outside [firstChanged, lastChanged] are provably unchanged from the previous
+		// frame. So if the previous frame had no images anywhere, only the changed range can have
+		// introduced one now, and the scan can be bounded to it (see expandChangedRangeForKittyImages
+		// for the same argument in more detail).
+		this.previousKittyImageIds =
+			this.previousKittyImageIds.size === 0
+				? this.collectKittyImageIds(newLines, firstChanged, lastChanged)
+				: this.collectKittyImageIds(newLines);
 		this.previousWidth = width;
 		this.previousHeight = height;
 	}
