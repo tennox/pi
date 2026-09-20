@@ -2886,7 +2886,11 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.model.cycleBackward", () => this.cycleModel("backward"));
 
 		// Global debug handler on TUI (works regardless of focus)
-		this.ui.onDebug = () => this.handleDebugCommand();
+		// ctrl+shift+d is manu's app.tools.expand binding (nix-config
+		// pi-keybindings.json); the hard-coded debug chord lives outside the
+		// keybindings registry and would shadow it. Unbound — the typed /debug
+		// command still works.
+		// this.ui.onDebug = () => this.handleDebugCommand();
 		this.defaultEditor.onAction("app.model.select", () => this.showModelSelector());
 		this.defaultEditor.onAction("app.tools.expand", () => this.toggleToolOutputExpansion());
 		this.defaultEditor.onAction("app.thinking.toggle", () => this.toggleThinkingBlockVisibility());
