@@ -95,6 +95,11 @@ describe("parseArgs", () => {
 			expect(result.model).toBe("gpt-4o");
 		});
 
+		test("parses -m model shorthand", () => {
+			const result = parseArgs(["-m", "gpt-4o"]);
+			expect(result.model).toBe("gpt-4o");
+		});
+
 		test("parses --api-key", () => {
 			const result = parseArgs(["--api-key", "sk-test-key"]);
 			expect(result.apiKey).toBe("sk-test-key");

@@ -103,7 +103,7 @@ export function parseArgs(args: string[]): Args {
 			result.resume = true;
 		} else if (arg === "--provider" && i + 1 < args.length) {
 			result.provider = args[++i];
-		} else if (arg === "--model" && i + 1 < args.length) {
+		} else if ((arg === "--model" || arg === "-m") && i + 1 < args.length) {
 			result.model = args[++i];
 		} else if (arg === "--api-key" && i + 1 < args.length) {
 			result.apiKey = args[++i];
@@ -276,7 +276,7 @@ ${chalk.bold("Commands:")}
 
 ${chalk.bold("Options:")}
   --provider <name>              Provider name (default: google)
-  --model <pattern>              Model pattern or ID (supports "provider/id" and optional ":<thinking>")
+  --model, -m <pattern>         Model pattern or ID (supports "provider/id" and optional ":<thinking>")
   --api-key <key>                API key (defaults to env vars)
   --system-prompt <text>         System prompt (default: coding assistant prompt)
   --append-system-prompt <text>  Append text or file contents to the system prompt (can be used multiple times)
