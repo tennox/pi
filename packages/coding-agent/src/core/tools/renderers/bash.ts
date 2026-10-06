@@ -6,9 +6,9 @@
  * tool definition, so the tool's public shape is unchanged.
  */
 
-import { Container, Text, truncateToWidth } from "@earendil-works/pi-tui";
+import { Container, Spacer, Text } from "@earendil-works/pi-tui";
 import { keyHint } from "../../../modes/interactive/components/keybinding-hints.ts";
-import { truncateToVisualLines } from "../../../modes/interactive/components/visual-truncate.ts";
+import { VisualLinePreview } from "../../../modes/interactive/components/visual-truncate.ts";
 import { theme } from "../../../modes/interactive/theme/theme.ts";
 import type { ToolDefinition, ToolRenderResultOptions } from "../../extensions/types.ts";
 import type { BashToolDetails } from "../bash.ts";
@@ -17,23 +17,16 @@ import { DEFAULT_MAX_BYTES, formatSize } from "../truncate.ts";
 
 const BASH_PREVIEW_LINES = 5;
 export const BASH_UPDATE_THROTTLE_MS = 100;
-type BashResultRenderState = {
-	cachedWidth: number | undefined;
-	cachedLines: string[] | undefined;
-	cachedSkipped: number | undefined;
-	/** Fully assembled array (including the "earlier lines" hint) returned to the caller, keyed by cachedWidth. */
-	cachedResult: string[] | undefined;
-};
-class BashResultRenderComponent extends Container {
-	state: BashResultRenderState = {
-		cachedWidth: undefined,
-		cachedLines: undefined,
-		cachedSkipped: undefined,
-		cachedResult: undefined,
-	};
-}
 function formatDuration(ms: number): string {
-	return `${(ms / 1000).toFixed(1)}s`;
+	const seconds = ms / 1000;
+	if (seconds < 60) return `${seconds.toFixed(1)}s`;
+
+	const totalSeconds = Math.floor(seconds);
+	const minutes = Math.floor(totalSeconds / 60);
+	const remainder = totalSeconds % 60;
+	if (minutes < 60) return `${minutes}m ${remainder}s`;
+
+	return `${Math.floor(minutes / 60)}h ${minutes % 60}m ${remainder}s`;
 }
 function formatShellCall(args: { command?: string; timeout?: number } | undefined, prompt: string): string {
 	const command = str(args?.command);
@@ -43,7 +36,7 @@ function formatShellCall(args: { command?: string; timeout?: number } | undefine
 	return theme.fg("toolTitle", theme.bold(`${prompt} ${commandDisplay}`)) + timeoutSuffix;
 }
 function rebuildBashResultRenderComponent(
-	component: BashResultRenderComponent,
+	component: Container,
 	result: {
 		content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>;
 		details?: BashToolDetails;
@@ -53,7 +46,6 @@ function rebuildBashResultRenderComponent(
 	startedAt: number | undefined,
 	endedAt: number | undefined,
 ): void {
-	const state = component.state;
 	component.clear();
 
 	let output = getTextOutput(result as any, showImages).trim();
@@ -75,37 +67,17 @@ function rebuildBashResultRenderComponent(
 		if (options.expanded) {
 			component.addChild(new Text(`\n${styledOutput}`, 0, 0));
 		} else {
-			component.addChild({
-				render: (width: number) => {
-					// The fully assembled array (including the "earlier lines" hint) is memoized by
-					// width. This must return the identical array reference on a cache hit so that
-					// ancestor Containers can skip re-concatenating their own rendered output.
-					if (state.cachedResult !== undefined && state.cachedWidth === width) {
-						return state.cachedResult;
-					}
-					const preview = truncateToVisualLines(styledOutput, BASH_PREVIEW_LINES, width);
-					state.cachedLines = preview.visualLines;
-					state.cachedSkipped = preview.skippedCount;
-					state.cachedWidth = width;
-					let result: string[];
-					if (state.cachedSkipped > 0) {
-						const hint =
-							theme.fg("muted", `... (${state.cachedSkipped} earlier lines,`) +
-							` ${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`;
-						result = ["", truncateToWidth(hint, width, "..."), ...state.cachedLines];
-					} else {
-						result = ["", ...state.cachedLines];
-					}
-					state.cachedResult = result;
-					return result;
-				},
-				invalidate: () => {
-					state.cachedWidth = undefined;
-					state.cachedLines = undefined;
-					state.cachedSkipped = undefined;
-					state.cachedResult = undefined;
-				},
-			});
+			component.addChild(new Spacer(1));
+			component.addChild(
+				new VisualLinePreview({
+					text: styledOutput,
+					maxVisualLines: BASH_PREVIEW_LINES,
+					keep: "end",
+					formatHint: (hidden) =>
+						theme.fg("muted", `... (${hidden} earlier lines,`) +
+						` ${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`,
+				}),
+			);
 		}
 	}
 
@@ -158,8 +130,7 @@ export function createShellRenderers(prompt: string): Pick<ToolDefinition<any, a
 					state.interval = undefined;
 				}
 			}
-			const component =
-				(context.lastComponent as BashResultRenderComponent | undefined) ?? new BashResultRenderComponent();
+			const component = (context.lastComponent as Container | undefined) ?? new Container();
 			rebuildBashResultRenderComponent(
 				component,
 				result as any,
