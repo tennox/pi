@@ -773,6 +773,28 @@ export class AgentSession {
 		);
 	}
 
+	/**
+	 * Hard pre-request guard: refuse to send a request whose projected context already exceeds
+	 * the model's raw context window. Throws so the loop terminates with a visible assistant
+	 * error (via `Agent.handleRunFailure`) instead of a 400 from the provider followed by an
+	 * empty response. No auto-recovery: compaction above already had its shot earlier in this
+	 * request's preparation path.
+	 *
+	 * Threshold is the raw window (not `contextWindow - reserveTokens`) so the guard only
+	 * catches cases where the provider would actually reject the request. Compaction's stricter
+	 * threshold (`contextWindow - reserveTokens`) keeps firing its own pre-prompt logic for
+	 * its reserve accounting; the guard complements it by cancelling the run when compaction
+	 * alone isn't enough.
+	 */
+	private _enforceContextGuardBeforeRequest(model: Model<any>, projection: SessionProjection): void {
+		if (model.contextWindow <= 0) return;
+		const estimate = estimateProjectedContextTokens(projection, this.sessionManager.getBranch());
+		if (estimate.tokens <= model.contextWindow) return;
+		throw new Error(
+			`context exhausted: ~${estimate.tokens} tokens exceeds limit ${model.contextWindow} — run cancelled (no automatic recovery)`,
+		);
+	}
+
 	private async _compactBeforeNextAssistantResponse(context: AgentContext): Promise<AgentContext> {
 		const projection = this.sessionManager.buildSessionProjection();
 		// A virtual selection is checked in prepareRequest, against the model the request is routed to.
@@ -811,6 +833,13 @@ export class AgentSession {
 			let { previous, context, projection } = await prepare();
 			const model = previous?.model ?? this.agent.state.model;
 			const thinkingLevel = previous?.thinkingLevel ?? this.agent.state.thinkingLevel;
+			// Hard context guard. Runs for every model (physical or virtual), before
+			// any routing / compaction specific to virtual selections. Throwing here
+			// surfaces the failure through the agent's `handleRunFailure`, so the run
+			// ends with an assistant error message + agent_end carrying the text — a
+			// subagent caller sees the structured message instead of a provider 400
+			// followed by an empty response.
+			this._enforceContextGuardBeforeRequest(model, projection);
 			if (!isVirtualModel(model)) return { ...previous, context, model, thinkingLevel };
 
 			// The selection stays in agent state; only this request uses the routed model. A routing
@@ -839,6 +868,7 @@ export class AgentSession {
 				await this._runAutoCompaction("threshold", false);
 				({ previous, context } = await prepare());
 			}
+			this._enforceContextGuardBeforeRequest(route.model, projection);
 			return { ...previous, context, model: route.model, thinkingLevel: route.thinkingLevel };
 		};
 	}
