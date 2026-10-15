@@ -19,6 +19,51 @@ import {
 	validateToolArguments,
 } from "@earendil-works/pi-ai";
 import { getDefaultStreamFn } from "./stream-fn.ts";
+
+// ============================================================================
+// Per-response parallel tool-call guard
+// ============================================================================
+//
+// A single assistant response can carry thousands of tool calls (one observed
+// incident: 2,454 calls, 538 KB of arguments, ~2.2M tokens of results hitting
+// a 1M-token window → provider 400 → agent died empty-handed). The cap runs
+// at the start of execution: the first N calls within the budget run normally,
+// the rest are converted to immediate error tool results so the model sees
+// WHY its calls were dropped (silent discard taught the model nothing and
+// invited the same blow-up on the next turn).
+//
+// Limits are tunable via env so anyone hitting the cap in practice can lift it
+// without touching the code:
+//   PI_MAX_PARALLEL_TOOL_CALLS           (default 20)
+//   PI_MAX_PARALLEL_TOOL_CALLS_ARG_BYTES (default 128*1024)
+
+const DEFAULT_MAX_PARALLEL_TOOL_CALLS = 20;
+const DEFAULT_MAX_PARALLEL_TOOL_CALLS_ARG_BYTES = 128 * 1024;
+
+function readPositiveIntEnv(name: string, fallback: number): number {
+	const raw = process.env[name];
+	if (raw === undefined || raw === "") return fallback;
+	const parsed = Number.parseInt(raw, 10);
+	if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+	return parsed;
+}
+
+function getMaxParallelToolCalls(): number {
+	return readPositiveIntEnv("PI_MAX_PARALLEL_TOOL_CALLS", DEFAULT_MAX_PARALLEL_TOOL_CALLS);
+}
+
+function getMaxParallelToolCallsArgBytes(): number {
+	return readPositiveIntEnv("PI_MAX_PARALLEL_TOOL_CALLS_ARG_BYTES", DEFAULT_MAX_PARALLEL_TOOL_CALLS_ARG_BYTES);
+}
+
+function toolCallArgumentBytes(toolCall: AgentToolCall): number {
+	let bytes = Buffer.byteLength(toolCall.name, "utf-8");
+	// Match the streaming serialize path: arguments ride the wire as JSON, so
+	// the serialized length is what the provider sees — use that for budgeting.
+	bytes += Buffer.byteLength(JSON.stringify(toolCall.arguments ?? {}), "utf-8");
+	return bytes;
+}
+
 import type {
 	AgentContext,
 	AgentEvent,
@@ -523,6 +568,26 @@ async function executeToolCalls(
 	emit: AgentEventSink,
 ): Promise<ExecutedToolCallBatch> {
 	const toolCalls = assistantMessage.content.filter((c) => c.type === "toolCall");
+	const maxCount = getMaxParallelToolCalls();
+	const maxArgBytes = getMaxParallelToolCallsArgBytes();
+	const { executable, droppedByCount, droppedByBudget } = splitToolCallsByBudget(toolCalls, maxCount, maxArgBytes);
+	if (droppedByCount.length > 0 || droppedByBudget.length > 0) {
+		const dropMessages = await emitDroppedToolResults(
+			[...droppedByCount, ...droppedByBudget],
+			droppedByCount.length,
+			droppedByBudget.length,
+			maxCount,
+			maxArgBytes,
+			emit,
+		);
+		if (executable.length === 0) {
+			// Every call in this response was capped. Still loop so the model can
+			// recover on the next turn (with fewer of them).
+			return { messages: dropMessages, terminate: false };
+		}
+		const batch = await runExecutableBatch(currentContext, assistantMessage, executable, config, signal, emit);
+		return { messages: [...dropMessages, ...batch.messages], terminate: batch.terminate };
+	}
 	const hasSequentialToolCall = toolCalls.some(
 		(tc) => currentContext.tools?.find((t) => t.name === tc.name)?.executionMode === "sequential",
 	);
@@ -530,6 +595,98 @@ async function executeToolCalls(
 		return executeToolCallsSequential(currentContext, assistantMessage, toolCalls, config, signal, emit);
 	}
 	return executeToolCallsParallel(currentContext, assistantMessage, toolCalls, config, signal, emit);
+}
+
+/**
+ * Split the model's tool calls into the subset we will execute and the subset we will
+ * drop with a visible "capped" tool result. Order is preserved: the first N calls
+ * within the per-call-count and per-byte budgets run; everything after the first cap
+ * gets dropped. The cumulative arg-byte budget is evaluated against calls accepted so
+ * far, so a single oversized call near the tail drops with a budget message instead
+ * of taking the rest of the batch with it.
+ */
+function splitToolCallsByBudget(
+	toolCalls: AgentToolCall[],
+	maxCount: number,
+	maxArgBytes: number,
+): { executable: AgentToolCall[]; droppedByCount: AgentToolCall[]; droppedByBudget: AgentToolCall[] } {
+	const executable: AgentToolCall[] = [];
+	const droppedByCount: AgentToolCall[] = [];
+	const droppedByBudget: AgentToolCall[] = [];
+	let usedBytes = 0;
+	for (let i = 0; i < toolCalls.length; i++) {
+		const toolCall = toolCalls[i];
+		if (i >= maxCount) {
+			droppedByCount.push(toolCall);
+			continue;
+		}
+		const bytes = toolCallArgumentBytes(toolCall);
+		if (executable.length > 0 && usedBytes + bytes > maxArgBytes) {
+			// The first call is always honored — refusing it would amount to dropping
+			// the whole response. Everything past that point shares the budget.
+			droppedByBudget.push(toolCall);
+			continue;
+		}
+		executable.push(toolCall);
+		usedBytes += bytes;
+	}
+	return { executable, droppedByCount, droppedByBudget };
+}
+
+async function emitDroppedToolResults(
+	dropped: AgentToolCall[],
+	droppedByCount: number,
+	droppedByBudget: number,
+	maxCount: number,
+	maxArgBytes: number,
+	emit: AgentEventSink,
+): Promise<ToolResultMessage[]> {
+	const messages: ToolResultMessage[] = [];
+	for (const toolCall of dropped) {
+		await emit({
+			type: "tool_execution_start",
+			toolCallId: toolCall.id,
+			toolName: toolCall.name,
+			args: toolCall.arguments,
+		});
+		const reason =
+			droppedByCount > 0 && droppedByBudget > 0
+				? `Tool call "${toolCall.name}" was not executed: the response exceeded both the per-response call cap (${maxCount}) and the per-response argument-byte budget (${maxArgBytes} bytes). Please re-issue fewer calls in a single response.`
+				: droppedByCount > 0
+					? `Tool call "${toolCall.name}" was not executed: the response exceeded the per-response call cap of ${maxCount} calls. Please re-issue fewer calls in a single response.`
+					: `Tool call "${toolCall.name}" was not executed: the response exceeded the per-response argument-byte budget of ${maxArgBytes} bytes (after counting earlier calls in the same response). Please re-issue fewer calls per response or shorten their arguments.`;
+		const finalized: FinalizedToolCallOutcome = {
+			toolCall,
+			result: createErrorToolResult(reason),
+			isError: true,
+		};
+		await emitToolExecutionEnd(finalized, emit);
+		const toolResultMessage = createToolResultMessage(finalized);
+		await emitToolResultMessage(toolResultMessage, emit);
+		messages.push(toolResultMessage);
+	}
+	return messages;
+}
+
+/**
+ * Dispatch the (capped) executable batch to the same path the original code took
+ * (sequential if any tool demands it or the caller configured it, otherwise parallel).
+ */
+async function runExecutableBatch(
+	currentContext: AgentContext,
+	assistantMessage: AssistantMessage,
+	executable: AgentToolCall[],
+	config: AgentLoopConfig,
+	signal: AbortSignal | undefined,
+	emit: AgentEventSink,
+): Promise<ExecutedToolCallBatch> {
+	const hasSequentialToolCall = executable.some(
+		(tc) => currentContext.tools?.find((t) => t.name === tc.name)?.executionMode === "sequential",
+	);
+	if (config.toolExecution === "sequential" || hasSequentialToolCall) {
+		return executeToolCallsSequential(currentContext, assistantMessage, executable, config, signal, emit);
+	}
+	return executeToolCallsParallel(currentContext, assistantMessage, executable, config, signal, emit);
 }
 
 type ExecutedToolCallBatch = {
