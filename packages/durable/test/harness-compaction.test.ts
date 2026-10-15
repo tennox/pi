@@ -19,10 +19,12 @@ import {
 	type ContextView,
 	type Conversation,
 	defineTask,
+	defineTool,
 	type EntryRecord,
 	type Harness,
 	LiveDoc,
 	MemoryStorage,
+	ProviderDoc,
 	StorageRejected,
 	type TaskId,
 	UsageDoc,
@@ -32,7 +34,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import { selectCut, serializeConversation } from "../src/harness/compaction.ts";
 import { orderToolResults } from "../src/harness/context.ts";
 import { openNodeSqliteStorage } from "../src/storage/sqlite/node.ts";
-import { allEntries, type ChatSetup, chatSetup, openChat, textOf, waitFor } from "./chat-support.ts";
+import { allEntries, type ChatSetup, chatSetup, openChat, textOf, toolsNamed, waitFor } from "./chat-support.ts";
+import { addHooks, addSection, addTask, addTool } from "./harness-support.ts";
 import { ControlledStorage, context } from "./session-support.ts";
 import { aborted, type Deferred, deferred } from "./task-support.ts";
 
@@ -135,10 +138,12 @@ async function open(
 	setup = chatSetup({ models: [{ id: "faux-1", contextWindow: options.contextWindow ?? 100_000, maxTokens: 900 }] }),
 	faux = script(setup),
 ): Promise<Chat> {
-	setup.registry.systemPrompt.section("preamble", () => "You are helpful.", { tag: false });
+	addSection(setup.registry, "preamble", () => "You are helpful.", { tag: false });
 	const { harness, root } = await openChat(options.storage ?? new MemoryStorage(), setup);
-	await root.setCompaction(options.policy ?? MANUAL, context);
-	await root.setRetryPolicy({ enabled: true, maxRetries: 2, baseDelayMs: 1 }, context);
+	// These tests exercise compaction accounting and thresholds, not the faux provider's cache simulation.
+	setup.settings.stream = { cacheRetention: "none" };
+	setup.settings.compaction = options.policy ?? MANUAL;
+	setup.settings.retry = { enabled: true, maxRetries: 2, baseDelayMs: 1 };
 	harness.resume();
 	return { harness, root, setup, faux };
 }
@@ -174,6 +179,11 @@ async function live(chat: Chat) {
 
 function userText(message: Message | undefined): string {
 	return textOf(message) ?? "";
+}
+
+/** Text of the first user message; a leading baseline system message comes before it. */
+function firstUserText(messages: readonly Message[]): string {
+	return userText(messages.find((message) => message.role === "user"));
 }
 
 // ─── Range selection ──────────────────────────────────────────────────────
@@ -384,7 +394,11 @@ describe("manual compaction", () => {
 		expect(prompt).not.toContain("u3 ");
 		expect(prompt).toContain("## Goal");
 		expect(prompt.endsWith("\n\nAdditional focus: focus on files")).toBe(true);
-		expect(request.options).toMatchObject({ cacheRetention: "none", maxTokens: 800 });
+		expect(request.options).toMatchObject({
+			cacheRetention: "none",
+			maxTokens: 800,
+			sessionId: (await chat.harness.snapshot(ProviderDoc, chat.root.id, context))!.sessionId,
+		});
 		expect(request.options?.deferred).toBeUndefined();
 
 		// The summarizer's spend is in the ledger, and nothing counts it again later.
@@ -395,6 +409,20 @@ describe("manual compaction", () => {
 		// The next request: the summary, the kept turn, the new input, then one complete system baseline.
 		expect(agent.map((message) => message.role)).toEqual(["user", "user", "assistant", "user", "system"]);
 		expect(agent[4]).toMatchObject({ sections: { preamble: "You are helpful." } });
+		await chat.harness.close(context);
+	});
+
+	// Regression coverage for #10424.
+	it("creates provider state before a legacy conversation's summarization request", async () => {
+		const chat = await open();
+		await history(chat);
+		await chat.root.commit((tx) => tx.retireDoc(ProviderDoc, chat.root.id), context);
+		expect(await chat.harness.snapshot(ProviderDoc, chat.root.id, context)).toBeUndefined();
+		chat.faux.summaries.push(summary());
+		expect((await result(chat, await chat.root.compact(undefined, context))).status).toBe("completed");
+		const stored = await chat.harness.snapshot(ProviderDoc, chat.root.id, context);
+		expect(stored?.sessionId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u);
+		expect(chat.faux.summaryRequests[0]!.options?.sessionId).toBe(stored?.sessionId);
 		await chat.harness.close(context);
 	});
 
@@ -421,13 +449,16 @@ describe("manual compaction", () => {
 
 	it("places a queued summary at postTools and the run continues in the compacted context", async () => {
 		const chat = await open();
-		chat.setup.registry.tools.add({
-			name: "wait",
-			description: "wait",
-			parameters: Type.Object({}),
-			execute: async () => ({ content: [{ type: "text", text: "waited" }] }),
-		});
-		await chat.root.setActiveTools(["wait"], context);
+		addTool(
+			chat.setup.registry,
+			defineTool({
+				name: "wait",
+				description: "wait",
+				parameters: Type.Object({}),
+				execute: async () => ({ content: [{ type: "text", text: "waited" }] }),
+			}),
+		);
+		await chat.root.configure({ tools: toolsNamed(chat.setup, "wait") }, context);
 		await history(chat);
 		const gate = deferred();
 		const reached = deferred();
@@ -471,7 +502,7 @@ describe("manual compaction", () => {
 		await result(chat, await chat.root.compact(undefined, context));
 		expect((await followUp.wait(context)).status).toBe("done");
 		const request = chat.faux.agentRequests.at(-1)!.messages;
-		expect(userText(request[0])).toContain("SUMMARY");
+		expect(firstUserText(request)).toContain("SUMMARY");
 		expect(request.some((message) => userText(message) === "follow-up")).toBe(true);
 		await chat.harness.close(context);
 	});
@@ -511,7 +542,7 @@ describe("manual compaction", () => {
 		// Placed and answered immediately with the uncompacted context, not queued behind the compaction.
 		expect((await input.status(context)).status).toBe("placed");
 		await answerReached.promise;
-		expect(userText(chat.faux.agentRequests.at(-1)!.messages[0])).toBe(text("u1", 100));
+		expect(firstUserText(chat.faux.agentRequests.at(-1)!.messages)).toBe(text("u1", 100));
 		// The summary is ready while the run is busy, so it queues and lands after the answer.
 		summaryGate.resolve();
 		const outcome = await result(chat, id);
@@ -571,7 +602,7 @@ describe("manual compaction", () => {
 			status: "unanswered",
 			reason: "stale",
 		});
-		expect(userText((await chat.root.context(context)).messages[0])).toContain("SECOND");
+		expect(firstUserText((await chat.root.context(context)).messages)).toContain("SECOND");
 		await chat.harness.close(context);
 	});
 
@@ -585,16 +616,16 @@ describe("manual compaction", () => {
 		const a = await chat.root.compact(undefined, context);
 		await reached.promise;
 		// B: larger budget, earlier cut; placed first.
-		await chat.root.setCompaction({ ...MANUAL, keepRecentTokens: 350 }, context);
+		chat.setup.settings.compaction = { ...MANUAL, keepRecentTokens: 350 };
 		chat.faux.summaries.push(summary("B"));
 		await result(chat, await chat.root.compact(undefined, context));
-		expect(userText((await chat.root.context(context)).messages[0])).toContain("B");
+		expect(firstUserText((await chat.root.context(context)).messages)).toContain("B");
 		gate.resolve();
 		const outcome = await result(chat, a);
 		const submissionId = outcome.status === "completed" ? outcome.result.submissionId! : undefined;
 		expect((await (await chat.harness.submission(submissionId!, context))!.status(context)).status).toBe("done");
 		const messages = (await chat.root.context(context)).messages;
-		expect(userText(messages[0])).toContain("<summary>\nA\n</summary>");
+		expect(firstUserText(messages)).toContain("<summary>\nA\n</summary>");
 		expect(messages.slice(1).map(userText)).toEqual([text("u3", 100), text("a3", 100)]);
 		await chat.harness.close(context);
 	});
@@ -614,7 +645,7 @@ describe("manual compaction", () => {
 			await reached.promise;
 			const submissions = [];
 			for (const [index, keep] of keeps.entries()) {
-				await chat.root.setCompaction({ ...MANUAL, keepRecentTokens: keep }, context);
+				chat.setup.settings.compaction = { ...MANUAL, keepRecentTokens: keep };
 				chat.faux.summaries.push(summary(`S${index}`));
 				const outcome = await result(chat, await chat.root.compact(undefined, context));
 				submissions.push(outcome.status === "completed" ? outcome.result.submissionId! : undefined);
@@ -685,7 +716,7 @@ describe("manual compaction", () => {
 		const setup = chatSetup();
 		const faux = script(setup);
 		const { harness, root } = await openChat(new MemoryStorage(), setup);
-		await root.setCompaction({ ...MANUAL, keepRecentTokens: 10 }, context);
+		setup.settings.compaction = { ...MANUAL, keepRecentTokens: 10 };
 		const id = await root.compact(undefined, context);
 		// getTask() only reads, so progress here comes from compact() itself.
 		await waitFor(async () => (await harness.getTask(id, context))?.state.status === "terminal");
@@ -711,23 +742,23 @@ describe("compaction outcomes", () => {
 	it("asks beforeCompact: the first decision wins, a throw is reported and skipped", async () => {
 		const chat = await open();
 		const seen: unknown[] = [];
-		chat.setup.registry.hooks.add(CompactionTask, {
+		addHooks(chat.setup.registry, CompactionTask, {
 			beforeCompact: () => {
 				throw new Error("hook broke");
 			},
 		});
-		chat.setup.registry.hooks.add(CompactionTask, {
+		addHooks(chat.setup.registry, CompactionTask, {
 			beforeCompact: (compaction) => {
 				seen.push(compaction);
 				return { summary: "FROM HOOK" };
 			},
 		});
-		chat.setup.registry.hooks.add(CompactionTask, { beforeCompact: () => ({ decline: true }) });
+		addHooks(chat.setup.registry, CompactionTask, { beforeCompact: () => ({ decline: true }) });
 		await history(chat);
 		const outcome = await result(chat, await chat.root.compact("why", context));
 		expect(outcome.status).toBe("completed");
 		expect(chat.faux.summaryRequests).toHaveLength(0);
-		expect(userText((await chat.root.context(context)).messages[0])).toContain("<summary>\nFROM HOOK\n</summary>");
+		expect(firstUserText((await chat.root.context(context)).messages)).toContain("<summary>\nFROM HOOK\n</summary>");
 		expect(chat.setup.reports).toEqual([expect.objectContaining({ message: "hook broke" })]);
 		const compaction = seen[0] as { entries: EntryRecord[]; messages: Message[]; firstKept: number };
 		expect(compaction).toMatchObject({ reason: "manual", instructions: "why" });
@@ -749,7 +780,7 @@ describe("compaction outcomes", () => {
 
 	it("completes without a summary when a hook declines", async () => {
 		const chat = await open();
-		chat.setup.registry.hooks.add(CompactionTask, { beforeCompact: () => ({ decline: true }) });
+		addHooks(chat.setup.registry, CompactionTask, { beforeCompact: () => ({ decline: true }) });
 		await history(chat);
 		expect(await result(chat, await chat.root.compact(undefined, context))).toEqual({
 			status: "completed",
@@ -762,7 +793,7 @@ describe("compaction outcomes", () => {
 	it("fails with no_model without a configured model", async () => {
 		const chat = await open();
 		await history(chat);
-		await chat.root.setModel(undefined, context);
+		await chat.root.configure({ model: null }, context);
 		const outcome = await result(chat, await chat.root.compact(undefined, context));
 		expect(outcome).toMatchObject({ status: "failed", error: { detail: { reason: "no_model" } } });
 		expect((await live(chat)).compactions).toBeUndefined();
@@ -781,7 +812,7 @@ describe("compaction outcomes", () => {
 	it("retries a retryable error with the pinned request and counts every attempt once", async () => {
 		const single = await open();
 		await history(single);
-		await single.root.setThinkingLevel("high", context);
+		await single.root.configure({ thinkingLevel: "high" }, context);
 		single.faux.summaries.push(summary());
 		const once = await compactionInput(single, async () =>
 			result(single, await single.root.compact(undefined, context)),
@@ -791,12 +822,12 @@ describe("compaction outcomes", () => {
 
 		const chat = await open();
 		await history(chat);
-		await chat.root.setThinkingLevel("high", context);
-		await chat.root.setStreamOptions({ timeoutMs: 1234, deferred: true }, context);
+		await chat.root.configure({ thinkingLevel: "high" }, context);
+		chat.setup.settings.stream = { timeoutMs: 1234, deferred: true };
 		chat.faux.summaries.push(async () => {
 			// Changed during the attempt: the retry still uses the pinned request.
-			await chat.root.setThinkingLevel("low", context);
-			await chat.root.setStreamOptions({ timeoutMs: 1 }, context);
+			await chat.root.configure({ thinkingLevel: "low" }, context);
+			chat.setup.settings.stream = { timeoutMs: 1 };
 			return failure("overloaded");
 		});
 		chat.faux.summaries.push(summary());
@@ -805,8 +836,14 @@ describe("compaction outcomes", () => {
 		});
 		expect(chat.faux.summaryRequests).toHaveLength(2);
 		expect(twice).toBe(2 * once);
+		const sessionId = (await chat.harness.snapshot(ProviderDoc, chat.root.id, context))!.sessionId;
 		for (const request of chat.faux.summaryRequests) {
-			expect(request.options).toMatchObject({ reasoning: "high", timeoutMs: 1234, cacheRetention: "none" });
+			expect(request.options).toMatchObject({
+				reasoning: "high",
+				timeoutMs: 1234,
+				cacheRetention: "none",
+				sessionId,
+			});
 			expect(request.options?.deferred).toBeUndefined();
 		}
 		await chat.harness.close(context);
@@ -815,7 +852,7 @@ describe("compaction outcomes", () => {
 	it("adds no usage when a hook declines or supplies the summary", async () => {
 		for (const decision of [{ decline: true } as const, { summary: "HOOK" }]) {
 			const chat = await open();
-			chat.setup.registry.hooks.add(CompactionTask, { beforeCompact: () => decision });
+			addHooks(chat.setup.registry, CompactionTask, { beforeCompact: () => decision });
 			await history(chat);
 			expect(
 				await compactionInput(chat, async () => result(chat, await chat.root.compact(undefined, context))),
@@ -826,15 +863,18 @@ describe("compaction outcomes", () => {
 
 	it("caps maxTokens at the model's output limit and sends no tools", async () => {
 		const chat = await open();
-		chat.setup.registry.tools.add({
-			name: "read",
-			description: "read",
-			parameters: Type.Object({}),
-			execute: async () => ({ content: [] }),
-		});
-		await chat.root.setActiveTools(["read"], context);
+		addTool(
+			chat.setup.registry,
+			defineTool({
+				name: "read",
+				description: "read",
+				parameters: Type.Object({}),
+				execute: async () => ({ content: [] }),
+			}),
+		);
+		await chat.root.configure({ tools: toolsNamed(chat.setup, "read") }, context);
 		await history(chat);
-		await chat.root.setCompaction({ ...MANUAL, reserveTokens: 2000 }, context);
+		chat.setup.settings.compaction = { ...MANUAL, reserveTokens: 2000 };
 		chat.faux.summaries.push(summary());
 		await result(chat, await chat.root.compact(undefined, context));
 		const request = chat.faux.summaryRequests[0]!;
@@ -898,7 +938,7 @@ describe("background threshold compaction", () => {
 	it("starts above the background threshold without blocking the run; idle waits and Esc ignore it", async () => {
 		const chat = await open({ contextWindow: 2000 });
 		await history(chat);
-		await chat.root.setCompaction(BACKGROUND, context);
+		chat.setup.settings.compaction = BACKGROUND;
 		const gate = deferred();
 		const reached = deferred();
 		chat.faux.summaries.push(gated(gate, summary(), reached));
@@ -918,7 +958,7 @@ describe("background threshold compaction", () => {
 		const outcome = await result(chat, task!.id as TaskId<CompactionResult>);
 		expect(outcome.status).toBe("completed");
 		expect((await kinds(chat.root)).at(-1)).toBe("pi.compaction");
-		expect(userText((await chat.root.context(context)).messages[0])).toContain("SUMMARY");
+		expect(firstUserText((await chat.root.context(context)).messages)).toContain("SUMMARY");
 		await chat.harness.close(context);
 	});
 
@@ -930,7 +970,7 @@ describe("background threshold compaction", () => {
 		it(`does not start when ${name}`, async () => {
 			const chat = await open({ contextWindow: 2000 });
 			await history(chat);
-			await chat.root.setCompaction(policy, context);
+			chat.setup.settings.compaction = policy;
 			await turn(chat, text("u4", 100), text("a4", 100));
 			expect(await compactionTasks(chat)).toEqual([]);
 			expect(chat.faux.summaryRequests).toHaveLength(0);
@@ -945,7 +985,7 @@ describe("background threshold compaction", () => {
 		chat.faux.summaries.push(gated(deferred(), summary(), reached));
 		const manual = await chat.root.compact(undefined, context);
 		await reached.promise;
-		await chat.root.setCompaction(BACKGROUND, context);
+		chat.setup.settings.compaction = BACKGROUND;
 		await turn(chat, text("u4", 100), text("a4", 100));
 		expect((await compactionTasks(chat)).map((task) => task.id)).toEqual([manual]);
 		await chat.harness.abortTask(manual, context);
@@ -956,7 +996,7 @@ describe("background threshold compaction", () => {
 		for (const stop of ["task", "conversation"] as const) {
 			const chat = await open({ contextWindow: 2000 });
 			await history(chat);
-			await chat.root.setCompaction(BACKGROUND, context);
+			chat.setup.settings.compaction = BACKGROUND;
 			const reached = deferred();
 			chat.faux.summaries.push(gated(deferred(), summary(), reached));
 			await turn(chat, text("u4", 100), text("a4", 100));
@@ -975,9 +1015,9 @@ describe("blocking threshold compaction", () => {
 	it("waits for its compaction, which appends the summary before the request", async () => {
 		const chat = await open({ contextWindow: 1000 });
 		await history(chat);
-		await chat.root.setCompaction(BLOCKING, context);
+		chat.setup.settings.compaction = BLOCKING;
 		// A new section: preparation has a system entry to append, but must not append it before the wait.
-		chat.setup.registry.systemPrompt.section("extra", () => "EXTRA");
+		addSection(chat.setup.registry, "extra", () => "EXTRA");
 		const gate = deferred();
 		const reached = deferred();
 		chat.faux.summaries.push(gated(gate, summary(), reached));
@@ -1002,7 +1042,7 @@ describe("blocking threshold compaction", () => {
 		expect((await result(chat, child!.id as TaskId<CompactionResult>)).status).toBe("completed");
 		expect((await kinds(chat.root)).slice(-3)).toEqual(["pi.compaction", "pi.system", "pi.assistant"]);
 		const request = chat.faux.agentRequests.at(-1)!.messages;
-		expect(userText(request[0])).toContain("SUMMARY");
+		expect(firstUserText(request)).toContain("SUMMARY");
 		const systems = request.filter((message) => message.role === "system");
 		expect(systems).toHaveLength(1);
 		expect(systems[0]).toMatchObject({
@@ -1014,7 +1054,7 @@ describe("blocking threshold compaction", () => {
 	it("sends the request once, without a second compaction, when the kept part is still above the threshold", async () => {
 		const chat = await open({ contextWindow: 1000 });
 		await history(chat);
-		await chat.root.setCompaction({ ...BLOCKING, keepRecentTokens: 700 }, context);
+		chat.setup.settings.compaction = { ...BLOCKING, keepRecentTokens: 700 };
 		chat.faux.summaries.push(summary());
 		await turn(chat, text("u4", 400), "a4");
 		expect(chat.faux.summaryRequests).toHaveLength(1);
@@ -1025,18 +1065,18 @@ describe("blocking threshold compaction", () => {
 	for (const [name, prepare] of [
 		[
 			"declines",
-			(chat: Chat) => chat.setup.registry.hooks.add(CompactionTask, { beforeCompact: () => ({ decline: true }) }),
+			(chat: Chat) => addHooks(chat.setup.registry, CompactionTask, { beforeCompact: () => ({ decline: true }) }),
 		],
 		["fails", (chat: Chat) => chat.faux.summaries.push(failure("bad request"))],
 	] as const) {
 		it(`sends the request anyway when its compaction ${name}`, async () => {
 			const chat = await open({ contextWindow: 1000 });
 			await history(chat);
-			await chat.root.setCompaction(BLOCKING, context);
+			chat.setup.settings.compaction = BLOCKING;
 			prepare(chat);
 			await turn(chat, text("u4", 200), "a4");
 			expect((await kinds(chat.root)).includes("pi.compaction")).toBe(false);
-			expect(userText(chat.faux.agentRequests.at(-1)!.messages[0])).toBe(text("u1", 100));
+			expect(firstUserText(chat.faux.agentRequests.at(-1)!.messages)).toBe(text("u1", 100));
 			await chat.harness.close(context);
 		});
 	}
@@ -1044,7 +1084,7 @@ describe("blocking threshold compaction", () => {
 	it("sends the request anyway when its compaction is aborted directly", async () => {
 		const chat = await open({ contextWindow: 1000 });
 		await history(chat);
-		await chat.root.setCompaction(BLOCKING, context);
+		chat.setup.settings.compaction = BLOCKING;
 		const reached = deferred();
 		chat.faux.summaries.push(gated(deferred(), summary(), reached));
 		chat.faux.agent.push(answer("a4"));
@@ -1060,7 +1100,7 @@ describe("blocking threshold compaction", () => {
 	it("is aborted with its generation by Esc, before the generation's abort handler", async () => {
 		const chat = await open({ contextWindow: 1000 });
 		await history(chat);
-		await chat.root.setCompaction(BLOCKING, context);
+		chat.setup.settings.compaction = BLOCKING;
 		const reached = deferred();
 		chat.faux.summaries.push(gated(deferred(), summary(), reached));
 		const events: AgentEvent[] = [];
@@ -1084,7 +1124,7 @@ describe("blocking threshold compaction", () => {
 	it("wins over a background compaction still in flight, which then settles stale", async () => {
 		const chat = await open({ contextWindow: 2000 });
 		await history(chat);
-		await chat.root.setCompaction(BACKGROUND, context);
+		chat.setup.settings.compaction = BACKGROUND;
 		const gate = deferred();
 		const reached = deferred();
 		chat.faux.summaries.push(gated(gate, summary("BACKGROUND"), reached));
@@ -1093,7 +1133,7 @@ describe("blocking threshold compaction", () => {
 		const [background] = await compactionTasks(chat);
 		chat.faux.summaries.push(summary("BLOCKING"));
 		await turn(chat, text("u5", 1000), "a5");
-		expect(userText((await chat.root.context(context)).messages[0])).toContain("BLOCKING");
+		expect(firstUserText((await chat.root.context(context)).messages)).toContain("BLOCKING");
 		gate.resolve();
 		const outcome = await result(chat, background!.id as TaskId<CompactionResult>);
 		const submissionId = outcome.status === "completed" ? outcome.result.submissionId! : undefined;
@@ -1111,7 +1151,7 @@ describe("overflow compaction", () => {
 	it("compacts and retries with the same attempt, leaving the error out of the retry", async () => {
 		const chat = await open();
 		await history(chat);
-		await chat.root.setCompaction(ENABLED, context);
+		chat.setup.settings.compaction = ENABLED;
 		chat.faux.summaries.push(summary());
 		let attempt: number | undefined;
 		chat.faux.agent.push(failure(OVERFLOW));
@@ -1140,7 +1180,7 @@ describe("overflow compaction", () => {
 	it("fails a second overflow with its error entry", async () => {
 		const chat = await open();
 		await history(chat);
-		await chat.root.setCompaction(ENABLED, context);
+		chat.setup.settings.compaction = ENABLED;
 		chat.faux.summaries.push(summary());
 		chat.faux.agent.push(failure(OVERFLOW), failure(OVERFLOW));
 		const input = await chat.root.submit({ type: "input", content: text("u4", 100) }, context);
@@ -1168,7 +1208,7 @@ describe("overflow compaction", () => {
 	it("fails after a blocking threshold compaction in the same generation", async () => {
 		const chat = await open({ contextWindow: 1000 });
 		await history(chat);
-		await chat.root.setCompaction(BLOCKING, context);
+		chat.setup.settings.compaction = BLOCKING;
 		chat.faux.summaries.push(summary());
 		chat.faux.agent.push(failure(OVERFLOW));
 		const input = await chat.root.submit({ type: "input", content: text("u4", 200) }, context);
@@ -1180,17 +1220,23 @@ describe("overflow compaction", () => {
 	for (const [name, prepare, requests] of [
 		[
 			"declines",
-			(chat: Chat) => chat.setup.registry.hooks.add(CompactionTask, { beforeCompact: () => ({ decline: true }) }),
+			(chat: Chat) => addHooks(chat.setup.registry, CompactionTask, { beforeCompact: () => ({ decline: true }) }),
 			0,
 		],
 		["fails", (chat: Chat) => chat.faux.summaries.push(failure("bad request")), 1],
 		// Classification finds no cut, so no compaction starts and the ordinary failure carries the text.
-		["cannot cut", (chat: Chat) => chat.root.setCompaction({ ...ENABLED, keepRecentTokens: 100_000 }, context), 0],
+		[
+			"cannot cut",
+			(chat: Chat) => {
+				chat.setup.settings.compaction = { ...ENABLED, keepRecentTokens: 100_000 };
+			},
+			0,
+		],
 	] as const) {
 		it(`fails with the overflow text when compaction ${name}`, async () => {
 			const chat = await open();
 			await turn(chat, text("u1", 100), text("a1", 100));
-			await chat.root.setCompaction(ENABLED, context);
+			chat.setup.settings.compaction = ENABLED;
 			await prepare(chat);
 			chat.faux.agent.push(failure(OVERFLOW));
 			const input = await chat.root.submit({ type: "input", content: text("u4", 100) }, context);
@@ -1213,22 +1259,25 @@ describe("compaction estimates and interactions", () => {
 			const chat = await open({ contextWindow: 2000 }, setup);
 			const toolGate = deferred();
 			const toolReached = deferred();
-			chat.setup.registry.tools.add({
-				name: "slow",
-				description: "slow",
-				parameters: Type.Object({}),
-				execute: async () => {
-					toolReached.resolve();
-					await toolGate.promise;
-					return { content: [{ type: "text", text: text("result", 200) }] };
-				},
-			});
-			await chat.root.setActiveTools(["slow"], context);
+			addTool(
+				chat.setup.registry,
+				defineTool({
+					name: "slow",
+					description: "slow",
+					parameters: Type.Object({}),
+					execute: async () => {
+						toolReached.resolve();
+						await toolGate.promise;
+						return { content: [{ type: "text", text: text("result", 200) }] };
+					},
+				}),
+			);
+			await chat.root.configure({ tools: toolsNamed(chat.setup, "slow") }, context);
 			await turn(chat, text("u1", 220), text("a1", 220));
 			await turn(chat, text("u2", 220), text("a2", 220));
 			await turn(chat, text("u3", 220), text("a3", 220));
 			// Background at 900, blocking at 1500: the tool call's usage plus its result would cross 1500.
-			await chat.root.setCompaction({ ...BACKGROUND, backgroundTokens: 600 }, context);
+			chat.setup.settings.compaction = { ...BACKGROUND, backgroundTokens: 600 };
 			// The request starts a background compaction; its tool call's usage measures the whole context.
 			chat.faux.agent.push(fauxAssistantMessage([fauxToolCall("slow", {})], { stopReason: "toolUse" }));
 			chat.faux.agent.push(answer("done"));
@@ -1248,7 +1297,7 @@ describe("compaction estimates and interactions", () => {
 			// The summary landed at postTools; the successor saw a small context and did not compact again.
 			expect(chat.faux.summaryRequests).toHaveLength(1);
 			expect(await compactionTasks(chat)).toEqual([]);
-			expect(userText(chat.faux.agentRequests.at(-1)!.messages[0])).toContain("SUMMARY");
+			expect(firstUserText(chat.faux.agentRequests.at(-1)!.messages)).toContain("SUMMARY");
 			await chat.harness.close(context);
 		});
 	}
@@ -1256,12 +1305,12 @@ describe("compaction estimates and interactions", () => {
 	it("rebaselines the system prompt over kept system deltas", async () => {
 		const chat = await open();
 		let mood = "cheerful";
-		chat.setup.registry.systemPrompt.section("mood", () => mood, { tag: false });
+		addSection(chat.setup.registry, "mood", () => mood, { tag: false });
 		await turn(chat, text("u1", 100), text("a1", 100));
 		await turn(chat, text("u2", 100), text("a2", 100));
 		mood = "terse";
 		await turn(chat, text("u3", 100), text("a3", 100));
-		await chat.root.setCompaction({ ...MANUAL, keepRecentTokens: 250 }, context);
+		chat.setup.settings.compaction = { ...MANUAL, keepRecentTokens: 250 };
 		chat.faux.summaries.push(summary());
 		await result(chat, await chat.root.compact(undefined, context));
 		// The kept range holds the delta for the terse mood; the next request has one complete baseline.
@@ -1294,7 +1343,7 @@ describe("compaction estimates and interactions", () => {
 			context,
 		);
 		let messages: readonly Message[] = [];
-		chat.setup.registry.hooks.add(CompactionTask, {
+		addHooks(chat.setup.registry, CompactionTask, {
 			beforeCompact: (compaction) => {
 				messages = compaction.messages;
 				return undefined;
@@ -1302,7 +1351,7 @@ describe("compaction estimates and interactions", () => {
 		});
 		chat.faux.summaries.push(summary());
 		await result(chat, await chat.root.compact(undefined, context));
-		expect(userText(messages[0])).toBe("REDACTED");
+		expect(firstUserText(messages)).toBe("REDACTED");
 		expect(userText(chat.faux.summaryRequests[0]!.messages[1])).toContain("[User]: REDACTED");
 		await chat.harness.close(context);
 	});
@@ -1372,7 +1421,7 @@ describe("compaction estimates and interactions", () => {
 			statuses.push((await (await chat.harness.submission(id!, context))!.status(context)).status);
 		}
 		expect(statuses).toEqual(["done", "done"]);
-		expect(userText((await chat.root.context(context)).messages[0])).toContain("CURRENT");
+		expect(firstUserText((await chat.root.context(context)).messages)).toContain("CURRENT");
 		await chat.harness.close(context);
 	});
 
@@ -1380,8 +1429,8 @@ describe("compaction estimates and interactions", () => {
 		const chat = await open();
 		const childGate = deferred();
 		const Child = defineChildTask(childGate);
-		chat.setup.registry.tasks.add(Child);
-		chat.setup.registry.hooks.add(CompactionTask, {
+		addTask(chat.setup.registry, Child);
+		addHooks(chat.setup.registry, CompactionTask, {
 			beforeCompact: async (_compaction, api, hookContext) => {
 				await chat.harness.commit(async (tx) => {
 					await tx.createTask(
@@ -1443,7 +1492,7 @@ describe("compaction events and live status", () => {
 	it("reports start and end, and the retry backoff in a late joiner's snapshot", async () => {
 		const chat = await open();
 		await history(chat);
-		await chat.root.setRetryPolicy({ enabled: true, maxRetries: 2, baseDelayMs: 60_000 }, context);
+		chat.setup.settings.retry = { enabled: true, maxRetries: 2, baseDelayMs: 60_000 };
 		const events: AgentEvent[] = [];
 		const stream = await watchEvents(chat.harness, chat.root.id, context);
 		stream.start(async (batch) => {
@@ -1500,11 +1549,11 @@ describe("compaction recovery", () => {
 
 	async function first(path: string) {
 		const setup = chatSetup();
-		setup.registry.systemPrompt.section("preamble", () => "You are helpful.", { tag: false });
+		addSection(setup.registry, "preamble", () => "You are helpful.", { tag: false });
 		const faux = script(setup);
 		const { harness, root } = await openChat(await openNodeSqliteStorage(path), setup);
-		await root.setCompaction(MANUAL, context);
-		await root.setRetryPolicy({ enabled: true, maxRetries: 2, baseDelayMs: 1 }, context);
+		setup.settings.compaction = MANUAL;
+		setup.settings.retry = { enabled: true, maxRetries: 2, baseDelayMs: 1 };
 		harness.resume();
 		const chat = { harness, root, setup, faux };
 		await history(chat);
@@ -1532,7 +1581,7 @@ describe("compaction recovery", () => {
 	it("fails an overflow run with its text when its compaction fails after reopen", async () => {
 		const path = await sqlitePath();
 		let chat = await first(path);
-		await chat.root.setCompaction({ ...MANUAL, enabled: true }, context);
+		chat.setup.settings.compaction = { ...MANUAL, enabled: true };
 		const reached = deferred();
 		chat.faux.summaries.push(gated(deferred(), summary(), reached));
 		chat.faux.agent.push(failure(OVERFLOW));
@@ -1556,7 +1605,7 @@ describe("compaction recovery", () => {
 		let chat = await first(path);
 		let calls = 0;
 		const reached = deferred();
-		chat.setup.registry.hooks.add(CompactionTask, {
+		addHooks(chat.setup.registry, CompactionTask, {
 			beforeCompact: async (_compaction, _api, hookContext) => {
 				calls++;
 				if (calls === 1) {
@@ -1605,7 +1654,7 @@ describe("compaction recovery", () => {
 		let chat = await first(path);
 		let now = Date.now();
 		chat.setup.now = () => now;
-		await chat.root.setRetryPolicy({ enabled: true, maxRetries: 2, baseDelayMs: 60_000 }, context);
+		chat.setup.settings.retry = { enabled: true, maxRetries: 2, baseDelayMs: 60_000 };
 		chat.faux.summaries.push(failure("overloaded"));
 		const id = await chat.root.compact(undefined, context);
 		await waitFor(async () => (await live(chat)).compactions?.[0]?.retry !== undefined);
@@ -1628,7 +1677,7 @@ describe("compaction recovery", () => {
 		const reached = deferred();
 		chat.faux.summaries.push(gated(deferred(), summary(), reached));
 		// The faux model window is 128k; this blocking threshold needs a small context window.
-		await chat.root.setCompaction({ ...BLOCKING, reserveTokens: 128_000 - 700 }, context);
+		chat.setup.settings.compaction = { ...BLOCKING, reserveTokens: 128_000 - 700 };
 		const input = await chat.root.submit({ type: "input", content: text("u4", 200) }, context);
 		await reached.promise;
 		await chat.harness.close(context);
@@ -1712,7 +1761,7 @@ describe("compaction and the inbox", () => {
 		await turn(chat, "again", "ok");
 		expect((await submission.status(context)).status).toBe("done");
 		const request = chat.faux.agentRequests.at(-1)!.messages;
-		expect(userText(request[0])).toContain("SUMMARY");
+		expect(firstUserText(request)).toContain("SUMMARY");
 		expect(request.map(userText)).toContain("again");
 		await chat.harness.close(context);
 	});
@@ -1720,7 +1769,7 @@ describe("compaction and the inbox", () => {
 	it("keeps the full retry budget after an overflow compaction", async () => {
 		const chat = await open();
 		await history(chat);
-		await chat.root.setCompaction({ ...MANUAL, enabled: true }, context);
+		chat.setup.settings.compaction = { ...MANUAL, enabled: true };
 		chat.faux.summaries.push(summary());
 		chat.faux.agent.push(
 			failure("prompt is too long"),
@@ -1769,9 +1818,9 @@ describe("compaction edge cases", () => {
 	it("keeps the one-compaction limit through a retry backoff", async () => {
 		const chat = await open({ contextWindow: 1000 });
 		await history(chat);
-		await chat.root.setCompaction(BLOCKING, context);
+		chat.setup.settings.compaction = BLOCKING;
 		let asked = 0;
-		chat.setup.registry.hooks.add(CompactionTask, {
+		addHooks(chat.setup.registry, CompactionTask, {
 			beforeCompact: () => {
 				asked++;
 				return { decline: true };
@@ -1788,11 +1837,11 @@ describe("compaction edge cases", () => {
 	it("does not start a background compaction when a manual one was admitted during preparation", async () => {
 		const chat = await open({ contextWindow: 2000 });
 		await history(chat);
-		await chat.root.setCompaction(BACKGROUND, context);
+		chat.setup.settings.compaction = BACKGROUND;
 		const rendering = deferred();
 		const release = deferred();
 		let hold = true;
-		chat.setup.registry.systemPrompt.section("slow", async () => {
+		addSection(chat.setup.registry, "slow", async () => {
 			if (hold) {
 				hold = false;
 				rendering.resolve();
@@ -1820,7 +1869,7 @@ describe("compaction edge cases", () => {
 		const chat = await open({ contextWindow: 2000 });
 		await history(chat);
 		// Blocking at 1500, background at 200: the kept part stays above the background threshold.
-		await chat.root.setCompaction({ ...BACKGROUND, backgroundTokens: 1300, keepRecentTokens: 400 }, context);
+		chat.setup.settings.compaction = { ...BACKGROUND, backgroundTokens: 1300, keepRecentTokens: 400 };
 		chat.faux.summaries.push(summary());
 		await turn(chat, text("u4", 1000), "a4");
 		expect(chat.faux.summaryRequests).toHaveLength(1);
@@ -1831,7 +1880,7 @@ describe("compaction edge cases", () => {
 	it("sends the request anyway when its blocking compaction faults", async () => {
 		const chat = await open({ contextWindow: 1000 });
 		await history(chat);
-		await chat.root.setCompaction(BLOCKING, context);
+		chat.setup.settings.compaction = BLOCKING;
 		const completeSimple = chat.setup.models.completeSimple.bind(chat.setup.models);
 		chat.setup.models.completeSimple = () => {
 			throw new Error("no credentials");
@@ -1847,7 +1896,7 @@ describe("compaction edge cases", () => {
 		for (const how of ["abort", "overflow"] as const) {
 			const chat = await open();
 			await history(chat);
-			await chat.root.setCompaction({ ...MANUAL, enabled: true }, context);
+			chat.setup.settings.compaction = { ...MANUAL, enabled: true };
 			const reached = deferred();
 			if (how === "abort") chat.faux.summaries.push(gated(deferred(), summary(), reached));
 			else chat.faux.summaries.push(failure("prompt is too long for the summary"));
@@ -1871,7 +1920,7 @@ describe("compaction edge cases", () => {
 	it("treats a length stop as an ordinary answer, not an overflow", async () => {
 		const chat = await open();
 		await history(chat);
-		await chat.root.setCompaction({ ...MANUAL, enabled: true }, context);
+		chat.setup.settings.compaction = { ...MANUAL, enabled: true };
 		chat.faux.agent.push(fauxAssistantMessage("cut short", { stopReason: "length", errorMessage: OVERFLOW }));
 		const input = await chat.root.submit({ type: "input", content: "go" }, context);
 		expect((await input.wait(context)).status).toBe("done");
@@ -1900,14 +1949,14 @@ describe("compaction edge cases", () => {
 	it("puts compaction_start last in the batch of the preparation commit", async () => {
 		const chat = await open({ contextWindow: 2000 });
 		await history(chat);
-		await chat.root.setCompaction(BACKGROUND, context);
+		chat.setup.settings.compaction = BACKGROUND;
 		const events: AgentEvent[][] = [];
 		const stream = await watchEvents(chat.harness, chat.root.id, context);
 		stream.start(async (batch) => {
 			events.push([...batch]);
 		});
 		// A new section makes the preparation commit append a system entry next to the compaction's status.
-		chat.setup.registry.systemPrompt.section("extra", () => "extra");
+		addSection(chat.setup.registry, "extra", () => "extra");
 		chat.faux.summaries.push(gated(deferred(), summary()));
 		await turn(chat, text("u4", 100), "a4");
 		await waitFor(() => events.some((batch) => batch.some((event) => event.type === "compaction_start")));
@@ -1921,8 +1970,8 @@ describe("compaction edge cases", () => {
 	it("keeps a background summary queued through a retry backoff while a blocking compaction wins", async () => {
 		const chat = await open({ contextWindow: 2000 });
 		await history(chat);
-		await chat.root.setCompaction(BACKGROUND, context);
-		await chat.root.setRetryPolicy({ enabled: true, maxRetries: 2, baseDelayMs: 300 }, context);
+		chat.setup.settings.compaction = BACKGROUND;
+		chat.setup.settings.retry = { enabled: true, maxRetries: 2, baseDelayMs: 300 };
 		const summaryGate = deferred();
 		const summaryReached = deferred();
 		chat.faux.summaries.push(gated(summaryGate, summary("BACKGROUND"), summaryReached));
@@ -1945,9 +1994,9 @@ describe("compaction edge cases", () => {
 			context,
 		))!;
 		expect((await submission.status(context)).status).toBe("queued");
-		await chat.root.setCompaction({ ...BACKGROUND, reserveTokens: 1500, keepRecentTokens: 50 }, context);
+		chat.setup.settings.compaction = { ...BACKGROUND, reserveTokens: 1500, keepRecentTokens: 50 };
 		expect((await input.wait(context)).status).toBe("done");
-		expect(userText(chat.faux.agentRequests.at(-1)!.messages[0])).toContain("BLOCKING");
+		expect(firstUserText(chat.faux.agentRequests.at(-1)!.messages)).toContain("BLOCKING");
 		expect(await submission.wait(context)).toMatchObject({ status: "unanswered", reason: "stale" });
 		await chat.harness.close(context);
 	});
@@ -1964,7 +2013,7 @@ describe("compaction edge cases", () => {
 		const prompt = userText(chat.faux.summaryRequests[1]!.messages[1]);
 		expect(prompt).toMatch(/^<conversation>\n\[User\]: The conversation history before this point was compacted/);
 		expect(prompt).toContain("FIRST");
-		expect(userText((await chat.root.context(context)).messages[0])).toContain("SECOND");
+		expect(firstUserText((await chat.root.context(context)).messages)).toContain("SECOND");
 		await chat.harness.close(context);
 	});
 
@@ -1994,7 +2043,7 @@ describe("blocking and manual compaction together", () => {
 	/** A run whose generation waits on a blocking compaction whose summary is held; returns the input and gate. */
 	async function blockingRun(chat: Chat) {
 		await history(chat);
-		await chat.root.setCompaction(BLOCKING, context);
+		chat.setup.settings.compaction = BLOCKING;
 		const gate = deferred();
 		const reached = deferred();
 		chat.faux.summaries.push(gated(gate, summary("BLOCKING"), reached));
@@ -2019,13 +2068,13 @@ describe("blocking and manual compaction together", () => {
 		run.gate.resolve();
 		expect((await run.input.wait(context)).status).toBe("done");
 		// The request after the blocking compaction used its summary; the manual one landed at the final boundary.
-		expect(userText(chat.faux.agentRequests.at(-1)!.messages[0])).toContain("BLOCKING");
+		expect(firstUserText(chat.faux.agentRequests.at(-1)!.messages)).toContain("BLOCKING");
 		expect((await submission.wait(context)).status).toBe("done");
 		const markers = (await allEntries(chat.root)).filter((record) => record.kind === "pi.compaction");
 		expect(markers).toHaveLength(2);
 		expect(markers[1]!.head).toBe(markers[0]!.head);
 		const messages = (await chat.root.context(context)).messages;
-		expect(userText(messages[0])).toContain("MANUAL");
+		expect(firstUserText(messages)).toContain("MANUAL");
 		expect(messages.some((message) => userText(message).includes("BLOCKING"))).toBe(false);
 		await chat.harness.close(context);
 	});
@@ -2086,7 +2135,7 @@ describe("blocking and manual compaction together", () => {
 		await turn(chat, "u5", "a5");
 		expect((await submission.status(context)).status).toBe("done");
 		const request = chat.faux.agentRequests.at(-1)!.messages;
-		expect(userText(request[0])).toContain("SUMMARY");
+		expect(firstUserText(request)).toContain("SUMMARY");
 		expect(request.map(userText)).toContain("u5");
 		const tail = (await allEntries(chat.root)).slice(-4).map((record) => record.kind);
 		expect(tail).toEqual(["pi.compaction", "pi.user", "pi.system", "pi.assistant"]);
@@ -2107,7 +2156,7 @@ describe("compaction pinning, silent overflow, and late policy changes", () => {
 		let attempt: number | undefined;
 		chat.faux.summaries.push(async () => {
 			// Switched during the attempt: the retry still uses the pinned model.
-			await chat.root.setModel({ provider: "faux", modelId: "faux-2" }, context);
+			await chat.root.configure({ model: { provider: "faux", modelId: "faux-2" } }, context);
 			return failure("overloaded");
 		});
 		chat.faux.summaries.push(async () => {
@@ -2144,10 +2193,12 @@ describe("compaction pinning, silent overflow, and late policy changes", () => {
 			const chat = await open({ contextWindow: 300 });
 			await history(chat);
 			// Thresholds out of reach, so only overflow classification could compact.
-			await chat.root.setCompaction(
-				{ enabled: true, reserveTokens: -100_000, keepRecentTokens: 150, backgroundTokens: 0 },
-				context,
-			);
+			chat.setup.settings.compaction = {
+				enabled: true,
+				reserveTokens: -100_000,
+				keepRecentTokens: 150,
+				backgroundTokens: 0,
+			};
 			chat.faux.agent.push(response);
 			const input = await chat.root.submit({ type: "input", content: "go" }, context);
 			expect((await input.wait(context)).status).toBe("done");
@@ -2162,13 +2213,13 @@ describe("compaction pinning, silent overflow, and late policy changes", () => {
 	it("sends the request when a blocking compaction finds nothing under a policy changed after preparation", async () => {
 		const chat = await open({ contextWindow: 1000 });
 		await history(chat);
-		await chat.root.setCompaction(BLOCKING, context);
+		chat.setup.settings.compaction = BLOCKING;
 		let changed = false;
-		chat.setup.registry.systemPrompt.section("policy", async () => {
+		addSection(chat.setup.registry, "policy", async () => {
 			// Rendering runs after preparation read the policy; the compaction reads this one.
 			if (!changed) {
 				changed = true;
-				await chat.root.setCompaction({ ...BLOCKING, keepRecentTokens: 100_000 }, context);
+				chat.setup.settings.compaction = { ...BLOCKING, keepRecentTokens: 100_000 };
 			}
 			return "p";
 		});
@@ -2243,7 +2294,7 @@ describe("context contributions", () => {
 		expect(view.contributions.map((messages) => messages.map(userText))).toEqual([["H"], ["a"], [], ["c"]]);
 		expect(view.messages.map(userText)).toEqual(["H", "a", "c"]);
 		// The summarizer sees the same contributions: the omitted entry stays out.
-		await chat.root.setCompaction({ ...MANUAL, keepRecentTokens: 1 }, context);
+		chat.setup.settings.compaction = { ...MANUAL, keepRecentTokens: 1 };
 		chat.faux.summaries.push(summary());
 		await result(chat, await chat.root.compact(undefined, context));
 		const prompt = userText(chat.faux.summaryRequests[0]!.messages[1]);

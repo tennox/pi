@@ -98,6 +98,8 @@ export type LoadedDocument = {
 /** Session services used by a transaction while it holds the mutation line. */
 export interface TransactionHost {
 	readonly storage: Storage;
+	/** Wall clock for task lifecycle times. */
+	now(): number;
 	/** Return the cached current incarnation without loading. */
 	cached(addressId: string): LoadedDocument | undefined;
 	/** Return the cached current incarnation, cold-loading and migrating it when necessary. */
@@ -268,7 +270,7 @@ export class Transaction implements Tx {
 		return this.#read("submission", () => this.#host.storage.submission(id, this.#context));
 	}
 
-	/** Internal: committed submission with a conversation-scoped request ID. */
+	/** Committed submission with a conversation-scoped request ID. */
 	submissionByRequest(conversationId: ConversationId, requestId: string): Promise<SubmissionRecord | undefined> {
 		return this.#read("submissionByRequest", () =>
 			this.#host.storage.submissionByRequest(conversationId, requestId, this.#context),
@@ -423,7 +425,7 @@ export class Transaction implements Tx {
 		});
 	}
 
-	/** Internal: create a submission record with a fresh ID. */
+	/** Create a raw submission record with a fresh ID; no admission rules apply. */
 	createSubmission(create: SubmissionCreate): Promise<SubmissionRecord> {
 		return this.#write(async () => {
 			await this.#requireConversation(create.conversationId);
@@ -467,7 +469,7 @@ export class Transaction implements Tx {
 		}
 		task.write = {
 			kind: task.write?.kind === "create" ? "create" : "replace",
-			record: copyJson(value, TABLE_JSON_COPY_OPTIONS) as unknown as AnyTaskRecord,
+			record: copyJson(this.#stampTimes(value, candidate), TABLE_JSON_COPY_OPTIONS) as unknown as AnyTaskRecord,
 		};
 	}
 
@@ -943,6 +945,23 @@ export class Transaction implements Tx {
 		}
 	}
 
+	/**
+	 * Lifecycle times: `startedAt` on the first change to `running`, `endedAt` on the change to `terminal`. Once set,
+	 * they carry over from the replaced record; records written before they existed lack them.
+	 */
+	#stampTimes(value: AnyTaskRecord, candidate: AnyTaskRecord | undefined): AnyTaskRecord {
+		const status = value.state.status;
+		const now = (stamps: boolean) => (stamps ? this.#host.now() : undefined);
+		const startedAt = candidate?.startedAt ?? value.startedAt ?? now(status === "running");
+		const endedAt = candidate?.endedAt ?? value.endedAt ?? now(status === "terminal");
+		if (startedAt === value.startedAt && endedAt === value.endedAt) return value;
+		return {
+			...value,
+			...(startedAt === undefined ? {} : { startedAt }),
+			...(endedAt === undefined ? {} : { endedAt }),
+		};
+	}
+
 	#taskEntry(id: TaskId): TransactionTask {
 		let task = this.#tasksById.get(id);
 		if (task === undefined) {
@@ -1014,7 +1033,10 @@ function planDocument(document: DocumentEntry): DocumentPlan | undefined {
 	}
 }
 
-/** Whether adoption publishes the plan: every creation, copy, and retirement, and a loaded incarnation that changed. */
+/**
+ * Whether adoption publishes the plan: every creation, copy, and retirement, and a loaded incarnation that writes
+ * content, which includes a migration-only base so observers of the older shape receive the new value.
+ */
 function publishes(plan: DocumentPlan): boolean {
-	return plan.retire || plan.change?.loaded === undefined || plan.change.prepared.ops.length > 0;
+	return plan.retire || plan.change?.loaded === undefined || plan.content !== undefined;
 }

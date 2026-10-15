@@ -45,9 +45,9 @@ import {
 } from "./observation.ts";
 import { type LoadedDocument, Transaction, type TransactionHost, type TransactionScope } from "./transaction.ts";
 
-/** Open a Session kernel over one storage backend. */
-export function createSession(storage: Storage): Session {
-	return new SessionImpl(storage);
+/** Open a Session kernel over one storage backend. `now` is the wall clock for task times; default `Date.now`. */
+export function createSession(storage: Storage, options?: { readonly now?: () => number }): Session {
+	return new SessionImpl(storage, options?.now);
 }
 
 /**
@@ -66,10 +66,11 @@ export class SessionImpl implements Session {
 	#closing: Promise<void> | undefined;
 	#poison: { readonly error: unknown } | undefined;
 
-	constructor(storage: Storage) {
+	constructor(storage: Storage, now: () => number = Date.now) {
 		this.#storage = storage;
 		this.#host = {
 			storage,
+			now,
 			cached: (id) => this.#documents.get(id),
 			load: (definition, addressId, address, context) => this.#loadDocument(definition, addressId, address, context),
 			install: (document) => {
@@ -489,7 +490,10 @@ export class SessionImpl implements Session {
 				if (change.type !== "document" || change.record.id !== loaded.record.id) continue;
 				// A document state's frames carry no caller cancellation; a watch observes its own cancellation.
 				const frameContext = observer instanceof CommittedStateSource ? withoutAbortSignal(context) : context;
-				observer.advance(change.value, observedOperations(observed, change), frameContext);
+				const ops = observedOperations(observed, change);
+				// A migration-only base changes nothing for an observer of the new version.
+				if (ops.length === 0) continue;
+				observer.advance(change.value, ops, frameContext);
 			}
 		});
 		unsubscribeClose = this.subscribeClose(() => observer.closeSession());

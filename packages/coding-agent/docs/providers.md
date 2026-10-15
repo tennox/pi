@@ -1,4 +1,4 @@
-# Provider Authentication
+# Providers
 
 Most hosted providers support one or both of these authentication methods:
 
@@ -17,8 +17,6 @@ Run `/logout` and select a provider to remove its stored credential. This does n
 
 `auth.json` can contain API keys and OAuth tokens. Keep it private and do not commit it.
 
-Radius authentication uses its gateway catalog and caches refreshed model metadata for later offline startup. A custom Radius gateway configured in `models.json` uses its own catalog rather than inheriting the public `radius.pi.dev` catalog.
-
 ## Use an API key from the environment
 
 Environment variables are useful in CI and anywhere Pi should not store the key. Set the variable before starting Pi:
@@ -28,7 +26,7 @@ export ANTHROPIC_API_KEY=sk-ant-...
 pi
 ```
 
-This table covers providers with a single primary API-key variable. Providers that need additional configuration or support ambient credentials are covered under [Cloud providers](#cloud-providers).
+This table covers providers with a single primary API-key variable. Providers that need additional configuration or support ambient credentials are covered under [Provider Specific Config](#provider-specific-config).
 
 | Provider | Environment variable |
 |---|---|
@@ -85,9 +83,9 @@ To use a secret manager without writing the resolved key to disk, set a provider
 
 Pi runs the command when the key is first needed and caches its standard output for the process lifetime. Empty output, a timeout, or a nonzero exit leaves the key unresolved until Pi restarts.
 
-## Cloud Providers
+## Provider Specific Config
 
-The providers below need additional settings or can use credentials supplied by their cloud platform.
+The providers below have additional setup, need additional settings, or can use credentials supplied by their platform.
 
 A stored API-key credential can include an `env` object. Its values take priority over the process environment for that provider:
 
@@ -103,7 +101,23 @@ A stored API-key credential can include an `env` object. Its values take priorit
 }
 ```
 
+### Radius
+
+Radius is a service crafted for Pi by the builders of Pi, Earendil Works. It provides a customizable AI gateway with organization-level controls and analytics built in, and artifacts for sharing what you create with Pi.
+
+To get started, run `/login radius` in Pi. This adds Radius as a provider, and its models appear in `/model` like any other provider's.
+
+Radius also has an MCP server, so Pi can manage Radius for you.
+
+Radius is currently in early alpha and evolving quickly. See [radius.earendil.com](https://radius.earendil.com) for more.
+
+Radius authentication uses its gateway catalog and caches refreshed model metadata for later offline startup. A custom Radius gateway configured in `models.json` uses its own catalog rather than inheriting the public `radius.pi.dev` catalog.
+
 ### Azure OpenAI
+
+The provider ID is `azure` (formerly `azure-openai-responses`). Use it as the key in `auth.json`, `models.json`, and `settings.json`, and in model references such as `--model azure/gpt-5.4`.
+
+The `azure` provider serves OpenAI models through the Responses API and Microsoft Foundry models through Chat Completions, such as `azure/deepseek-v4-pro`.
 
 Set an API key plus either a base URL or resource name:
 
@@ -115,6 +129,29 @@ export AZURE_OPENAI_RESOURCE_NAME=your-resource
 ```
 
 Resource root URLs under `ai.azure.com`, `cognitiveservices.azure.com`, and `openai.azure.com` are normalized to the OpenAI API path.
+
+Pi sends the model ID as the deployment name. If a deployment has a different name, map it with `AZURE_OPENAI_DEPLOYMENT_NAME_MAP`:
+
+```bash
+export AZURE_OPENAI_DEPLOYMENT_NAME_MAP=gpt-5.4=my-gpt-deployment,deepseek-v4-pro=my-deepseek
+```
+
+`AZURE_OPENAI_API_VERSION` overrides the API version for OpenAI models (default `v1`).
+
+To use a Foundry model that Pi does not include, add it under `azure` in [`models.json`](models.md#configure-a-compatible-endpoint) with `api: "openai-completions"`. Custom models require a `baseUrl`; `AZURE_OPENAI_BASE_URL` and `AZURE_OPENAI_RESOURCE_NAME` take priority over it when set:
+
+```json
+{
+  "providers": {
+    "azure": {
+      "baseUrl": "https://your-resource.services.ai.azure.com",
+      "models": [
+        { "id": "your-deployment", "api": "openai-completions" }
+      ]
+    }
+  }
+}
+```
 
 ### Amazon Bedrock
 

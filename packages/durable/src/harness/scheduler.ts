@@ -22,14 +22,16 @@ import type {
 	TaskRuntime,
 	TaskState,
 } from "../types.ts";
-import { readContext } from "./context.ts";
+import { agentHooks } from "./agent.ts";
+import { type ContextRange, readContextFrom } from "./context.ts";
 import type {
+	Agent,
 	AnyTask,
 	ConversationHandle,
 	HarnessInspection,
-	HookScope,
 	RegistryReader,
 	RegistrySnapshot,
+	Settings,
 	SettledTask,
 	TaskInspection,
 } from "./types.ts";
@@ -76,6 +78,13 @@ type Invocation = {
 	ended: boolean;
 	readonly done: Promise<void>;
 	readonly finish: () => void;
+};
+
+/** What a runtime reads for the phase handler it serves: the phase's snapshot and task, and its lazily resolved agent. */
+type Phase = {
+	readonly snapshot: () => RegistrySnapshot;
+	readonly task: () => AnyTask;
+	agent: Promise<Agent> | undefined;
 };
 
 type Reservation = {
@@ -125,7 +134,12 @@ export type TaskSchedulerOptions = {
 	readonly storage: Storage;
 	readonly registry: RegistryReader;
 	readonly models: Models;
-	readonly env: ExecutionEnv | undefined;
+	/** Resolve a conversation's agent against a snapshot; the runtime calls it at most once per phase. */
+	readonly agent: (conversationId: ConversationId, snapshot: RegistrySnapshot, context: Context) => Promise<Agent>;
+	/** Resolve the settings; read at each access. */
+	readonly settings: () => Settings;
+	/** Build a conversation's environment with `HarnessOptions.env`. */
+	readonly env: (conversationId: ConversationId, context: Context) => Promise<ExecutionEnv | undefined>;
 	readonly now: () => number;
 	readonly report: (error: unknown) => void;
 	/** Harness cleanup staged in the commit that makes an outcome the scheduler wrote itself terminal. */
@@ -162,7 +176,9 @@ export class TaskScheduler {
 	readonly #storage: Storage;
 	readonly #registry: RegistryReader;
 	readonly #models: Models;
-	readonly #env: ExecutionEnv | undefined;
+	readonly #agent: TaskSchedulerOptions["agent"];
+	readonly #settings: TaskSchedulerOptions["settings"];
+	readonly #env: TaskSchedulerOptions["env"];
 	readonly #now: () => number;
 	readonly #report: (error: unknown) => void;
 	readonly #settleOutcome: TaskSchedulerOptions["settleOutcome"];
@@ -170,6 +186,14 @@ export class TaskScheduler {
 	readonly #conversation: TaskSchedulerOptions["conversation"];
 	readonly #context: Context;
 	readonly #live = new Map<TaskId, AnyTaskRecord>();
+	/**
+	 * Context range last read through a task runtime, per conversation: a later read, by any of its tasks, scans only
+	 * newer entries. `idleSince` is the Harness time it was first seen idle. Derived and never persisted; dropped at the
+	 * first idle check after `settings.contextRetentionMs` of idleness, and at close.
+	 */
+	readonly #contexts = new Map<ConversationId, { range: ContextRange; idleSince: number | undefined }>();
+	/** Timer for the earliest expiry of an idle context, only where timers can be unreferenced (see `#scheduleExpiry`). */
+	#expiry: { readonly at: number; readonly timer: ReturnType<typeof setTimeout> } | undefined;
 	readonly #invocations = new Map<TaskId, Invocation>();
 	readonly #taskWaiters = new Waiters<TaskId, SettledTask<JsonValue>>();
 	/** Idle waiters by conversation; `undefined` waits for the whole Harness. */
@@ -200,6 +224,8 @@ export class TaskScheduler {
 		this.#storage = options.storage;
 		this.#registry = options.registry;
 		this.#models = options.models;
+		this.#agent = options.agent;
+		this.#settings = options.settings;
 		this.#env = options.env;
 		this.#now = options.now;
 		this.#report = options.report;
@@ -396,14 +422,75 @@ export class TaskScheduler {
 		// Also retries, with the next commit of any kind, a cascade whose commit failed.
 		if (this.#cascadePending) this.#scheduleReconcile();
 		if (!changed) return;
-		this.#resolveIdleWaiters();
+		this.#settleIdle();
 		this.#kick();
 	}
 
-	#resolveIdleWaiters(): void {
+	/**
+	 * `settings.contextRetentionMs`, or 0 when the host's settings throw. Kept contexts are only a cache, so dropping them
+	 * is safe, while a throw here would escape commit listeners, reconciliation, and the expiry timer.
+	 */
+	#contextRetentionMs(): number {
+		try {
+			return this.#settings().contextRetentionMs;
+		} catch (error) {
+			this.#report(error);
+			return 0;
+		}
+	}
+
+	/** Resolve idle waiters, and drop each kept context whose conversation has been idle for the retention period. */
+	#settleIdle(): void {
 		for (const conversationId of this.#idleWaiters.keys()) {
 			if (this.#idle(conversationId)) this.#idleWaiters.resolve(conversationId);
 		}
+		const now = this.#now();
+		const retention = this.#contextRetentionMs();
+		for (const [conversationId, kept] of this.#contexts) {
+			if (kept.idleSince !== undefined && now - kept.idleSince >= retention) {
+				this.#contexts.delete(conversationId);
+			} else if (!this.#idle(conversationId)) {
+				kept.idleSince = undefined;
+			} else if (retention > 0) {
+				kept.idleSince ??= now;
+			} else {
+				this.#contexts.delete(conversationId);
+			}
+		}
+		this.#scheduleExpiry();
+	}
+
+	/**
+	 * Run `#settleIdle()` when the earliest idle context expires. The timer is unreferenced, so it never keeps the process
+	 * alive. Where timers cannot be unreferenced, as in Cloudflare Workers, none is kept: a pending timer could keep a
+	 * Durable Object from being evicted, and eviction frees the contexts. There, task changes alone check expiry.
+	 */
+	#scheduleExpiry(): void {
+		const retention = this.#contextRetentionMs();
+		let at: number | undefined;
+		for (const kept of this.#contexts.values()) {
+			if (kept.idleSince !== undefined && (at === undefined || kept.idleSince + retention < at)) {
+				at = kept.idleSince + retention;
+			}
+		}
+		if (this.#expiry !== undefined && this.#expiry.at === at) return;
+		if (this.#expiry !== undefined) clearTimeout(this.#expiry.timer);
+		this.#expiry = undefined;
+		if (at === undefined || this.#closing) return;
+		const timer = setTimeout(
+			() => {
+				this.#expiry = undefined;
+				this.#settleIdle();
+			},
+			Math.min(Math.max(0, at - this.#now()), MAX_TIMER_DELAY),
+		);
+		const unref = (timer as { unref?: unknown }).unref;
+		if (typeof unref !== "function") {
+			clearTimeout(timer);
+			return;
+		}
+		unref.call(timer);
+		this.#expiry = { at, timer };
 	}
 
 	// ─── Ownership ───────────────────────────────────────────────────────────
@@ -458,7 +545,7 @@ export class TaskScheduler {
 			for (const id of checks) this.#failFastChecks.add(id);
 			if (!this.#closing) this.#report(error);
 		}
-		this.#resolveIdleWaiters();
+		this.#settleIdle();
 	}
 
 	/** Whether any of `ids` holds or ended with an outcome other than `completed`. */
@@ -651,6 +738,9 @@ export class TaskScheduler {
 		const error = closedError();
 		this.#taskWaiters.rejectAll(error);
 		this.#idleWaiters.rejectAll(error);
+		this.#contexts.clear();
+		if (this.#expiry !== undefined) clearTimeout(this.#expiry.timer);
+		this.#expiry = undefined;
 		for (const invocation of this.#invocations.values()) invocation.controller.abort();
 	}
 
@@ -835,17 +925,16 @@ export class TaskScheduler {
 	async #run(reservation: Reservation): Promise<void> {
 		const invocation = reservation.invocation;
 		const state = { task: reservation.task, snapshot: reservation.snapshot, reported: undefined as ReportedTask };
-		const runtime = this.#runtime(
-			invocation,
-			() => state.snapshot,
-			() => state.task,
-		);
+		const phase: Phase = { snapshot: () => state.snapshot, task: () => state.task, agent: undefined };
+		const runtime = this.#runtime(invocation, phase);
 		let previous: PhaseResult | undefined;
 		for (;;) {
 			const current = await this.#step(invocation, (tx, current) => this.#decide(tx, current, previous, state));
 			// Close may seal between the decision and dispatch.
 			if (current === undefined || this.#closing) return;
 			const checkpoint = current.state.checkpoint;
+			// Each phase handler resolves its agent afresh, at first use.
+			phase.agent = undefined;
 			try {
 				await erased(state.task).phases[checkpoint.phase]!(current, runtime, invocation.context);
 				previous = { checkpoint };
@@ -901,11 +990,8 @@ export class TaskScheduler {
 		if (current === undefined || this.#closing) return;
 		let failure: { readonly error: unknown } | undefined;
 		try {
-			const runtime = this.#runtime(
-				invocation,
-				() => reservation.snapshot,
-				() => reservation.task,
-			);
+			const phase: Phase = { snapshot: () => reservation.snapshot, task: () => reservation.task, agent: undefined };
+			const runtime = this.#runtime(invocation, phase);
 			await erased(reservation.task).abort(current, runtime, invocation.context);
 		} catch (error) {
 			failure = { error };
@@ -1031,14 +1117,22 @@ export class TaskScheduler {
 
 	// ─── Invocation runtime ──────────────────────────────────────────────────
 
-	#runtime(invocation: Invocation, snapshot: () => RegistrySnapshot, task: () => AnyTask): ErasedRuntime {
+	#runtime(invocation: Invocation, phase: Phase): ErasedRuntime {
+		// Resolved at most once per phase handler, at first use, with the invocation's context; fixed for the phase.
+		const agent = (): Promise<Agent> => {
+			if (invocation.ended) return Promise.reject(endedError(invocation));
+			if (phase.agent === undefined) {
+				phase.agent = this.#agent(invocation.conversationId, phase.snapshot(), invocation.context);
+				// A caller that stops waiting must not leave the shared resolution's failure unobserved.
+				phase.agent.catch(() => {});
+			}
+			return phase.agent;
+		};
 		const hooks: HookRunner<Record<string, unknown>> = {
 			each: async (name, invoke) => {
-				if (invocation.ended) throw endedError(invocation);
-				for (const { handlers, scope } of snapshot().hooks(task())) {
+				for (const handlers of agentHooks(await agent(), phase.task().definition.name)) {
 					const handler = (handlers as Record<string, unknown>)[name];
 					if (typeof handler !== "function") continue;
-					if (scope !== undefined && !(await this.#hookMatches(invocation, scope))) continue;
 					try {
 						await invoke(handler.bind(handlers));
 					} catch (error) {
@@ -1048,15 +1142,21 @@ export class TaskScheduler {
 				}
 			},
 		};
+		const settings = this.#settings;
 		return {
 			taskId: invocation.taskId as TaskId<JsonValue>,
 			conversationId: invocation.conversationId,
 			signal: invocation.controller.signal,
 			models: this.#models,
-			env: this.#env,
+			agent: (context) =>
+				invocation.ended ? Promise.reject(endedError(invocation)) : awaitWithContext(agent(), context),
+			get settings() {
+				return settings();
+			},
+			env: (context) => this.#read(invocation, () => this.#env(invocation.conversationId, context)),
 			hooks: hooks as ErasedRuntime["hooks"],
 			get registry() {
-				return snapshot();
+				return phase.snapshot();
 			},
 			commit: (change, context) =>
 				this.#gated(
@@ -1139,23 +1239,43 @@ export class TaskScheduler {
 					return token === undefined || entry?.kind === token.kind ? entry : undefined;
 				});
 			}) as ErasedRuntime["entry"],
-			context: (conversationId, context, at) =>
-				this.#read(invocation, () => readContext(this.#session, this.#storage, conversationId, context, at)),
-			now: () => this.#now(),
-			report: (error) => this.#report(error),
+			context: (conversationId, context, options) =>
+				this.#read(invocation, async () => {
+					const { view, range } = await readContextFrom(
+						this.#session,
+						this.#storage,
+						conversationId,
+						context,
+						options?.at,
+						this.#contexts.get(conversationId)?.range,
+					);
+					// Keep it unless the invocation ended or a concurrent read already kept a newer range.
+					const kept = this.#contexts.get(conversationId);
+					if (
+						range !== undefined &&
+						!this.#closing &&
+						!invocation.ended &&
+						(kept === undefined || kept.range.bounds.tail <= range.bounds.tail)
+					) {
+						// A read of another, idle conversation starts or continues its retention period.
+						if (!this.#idle(conversationId)) {
+							this.#contexts.set(conversationId, { range, idleSince: undefined });
+						} else if (this.#contextRetentionMs() > 0) {
+							this.#contexts.set(conversationId, { range, idleSince: kept?.idleSince ?? this.#now() });
+							this.#scheduleExpiry();
+						}
+					}
+					return view;
+				}),
+			now: () => {
+				if (invocation.ended) throw endedError(invocation);
+				return this.#now();
+			},
+			report: (error) => {
+				if (invocation.ended) throw endedError(invocation);
+				this.#report(error);
+			},
 		};
-	}
-
-	/** Whether a scoped hook registration matches the invocation's conversation: itself, or an owner for `subtree`. */
-	async #hookMatches(invocation: Invocation, scope: HookScope): Promise<boolean> {
-		if (scope.conversationId === invocation.conversationId) return true;
-		if (scope.subtree !== true) return false;
-		const start = { conversation: invocation.conversationId };
-		if (!this.#chainKnown(start)) await this.#session.readOnLine(() => this.#loadChain(start));
-		for (const step of this.#above(start)) {
-			if ("conversation" in step && step.conversation === scope.conversationId) return true;
-		}
-		return false;
 	}
 
 	/** Run a committed-state read unless the invocation has ended. */

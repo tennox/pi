@@ -39,7 +39,7 @@ await sandbox.close();
 
 - `tools.<name>(args)` returns a promise. Arguments and results make a JSON round trip. A tool that throws rejects with an `Error` carrying the same message. Tool names are also exposed as identifiers: characters that are not valid in identifiers become `_` (`toCodemodeIdentifier`), so `my-tool` is `tools.my_tool` as well as `tools["my-tool"]`.
 - `ALL_TOOLS` lists `{ name, description }` for every tool, with `name` as the identifier.
-- `text(value)` appends a text item to `result.output`; values other than strings are JSON-stringified. `console.log/info/warn/error/debug` append text items too.
+- `text(value)` appends a text item to `result.output`; values other than strings are JSON-stringified. `console.log/info/warn/error/debug` append text items with `console: true`.
 - `image(urlOrItem)` appends an image item. It accepts a base64 `data:` URL, `{ image_url }`, or an MCP `ImageContent` block (`{ type: "image", data, mimeType }`). Remote URLs are rejected.
 - `exit()` ends the script successfully right away, keeping its output and store writes.
 - `globals` passed to the sandbox are called as top-level functions, for example a host helper `image(ref)`. They behave like tools but are not recorded in `result.calls`. A name like `models.classify` puts the function on a frozen `models` object. With `spread: true`, `execute` receives all call arguments as an array instead of the first one, and `signature` replaces the declaration generated from the schemas.
@@ -171,7 +171,7 @@ const codemodeTool: AgentTool = {
 | `aborted` | `options.signal` fired or `close()` was called; the worker was terminated   |
 | `sandbox` | the worker or VM failed, for example a wasm trap or a missing worker file   |
 
-`result.output` holds the text and image items in the order the script produced them, also for failed executions. `result.calls` lists every tool call with `status: "ok" | "error" | "cancelled"`. A call that is still running when the script returns (not awaited) is aborted through the tool's `signal` and reported as `cancelled`.
+`result.output` holds the text and image items in the order the script produced them, also for failed executions. The host keeps all of it until the script ends, so output is limited to `MAX_OUTPUT_CHARS` (16 Mi) characters of text and base64 image data and `MAX_OUTPUT_ITEMS` (100000) items. Past either limit the script fails with a `RangeError`, even if it catches the error. `result.calls` lists every tool call with `status: "ok" | "error" | "cancelled"`. A call that is still running when the script returns (not awaited) is aborted through the tool's `signal` and reported as `cancelled`.
 
 ## How it works
 

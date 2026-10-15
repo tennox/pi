@@ -19,7 +19,7 @@ import type {
 } from "../types.ts";
 import { assignJson } from "./json.ts";
 import { clearProgress, finishSlot, LiveDoc, type ToolSlot, toolSlot } from "./live.ts";
-import { boundOutput, OutputBuffer, type OutputLimits, Progress } from "./output.ts";
+import { boundOutput, OutputBuffer, type OutputLimits, PROGRESS_BYTES_PER_SECOND, Progress } from "./output.ts";
 import type {
 	ToolControl,
 	ToolDiagnostic,
@@ -43,7 +43,7 @@ type Runtime = TaskRuntime<ToolTaskInput, ToolTaskCheckpoint, ToolTaskResult, To
 type Content = (TextContent | ImageContent)[];
 
 /**
- * Built-in tool task: resolves the called tool from its phase snapshot, validates, runs `beforeTool`, records intent,
+ * Built-in tool task: resolves the called tool among its phase agent's tools, validates, runs `beforeTool`, records intent,
  * executes, runs `afterTool`, and appends the result, all in one `call` handler so nothing separates resolution from
  * settlement. `execute` is reached only by recovery and applies the replay rule.
  */
@@ -54,7 +54,7 @@ export const ToolTask = defineTask<ToolTaskInput, ToolTaskCheckpoint, ToolTaskRe
 	phases: {
 		call: async (task, runtime, context) => {
 			const call = await readCall(runtime, task.input, context);
-			const tool = runtime.registry.tool(call.name);
+			const tool = (await runtime.agent(context)).tools.find((each) => each.name === call.name);
 			if (tool === undefined) {
 				const error = harnessError("tool_unavailable", `Tool ${call.name} is not available`);
 				return settle(runtime, call, COMPLETED, () => error, context);
@@ -94,7 +94,7 @@ export const ToolTask = defineTask<ToolTaskInput, ToolTaskCheckpoint, ToolTaskRe
 		execute: async (task, runtime, context) => {
 			const { arguments: args, replay } = task.state.checkpoint;
 			const call = await readCall(runtime, task.input, context);
-			const tool = runtime.registry.tool(call.name);
+			const tool = (await runtime.agent(context)).tools.find((each) => each.name === call.name);
 			if (replay === "safe" && tool?.replay === "safe") {
 				// The rerun reports from scratch; clear what the interrupted attempt published.
 				await runtime.commit(async (tx) => {
@@ -184,15 +184,26 @@ async function run(
 	const assertLive = (): void => {
 		if (ended) throw new Error(`Tool call ${call.id} has settled`);
 	};
-	const api: ToolExecutionApi = {
+	const api: Omit<ToolExecutionApi, "env"> = {
 		taskId: runtime.taskId,
 		conversationId: runtime.conversationId,
 		callId: call.id,
-		env: runtime.env,
-		output: (chunk) => {
+		registry: runtime.registry,
+		agent: runtime.agent,
+		models: runtime.models,
+		output: (chunk, skipped) => {
 			assertLive();
-			if (reported.output.push(chunk)) progress.mark();
+			if (reported.output.push(chunk, skipped)) progress.mark();
 		},
+		outputWindow:
+			limits.retain === "tail"
+				? {
+						maxBytes: limits.maxBytes,
+						maxLines: limits.maxLines,
+						minIntervalMs: runtime.settings.progress.outputIntervalMs,
+						bytesPerSecond: PROGRESS_BYTES_PER_SECOND,
+					}
+				: undefined,
 		diagnostic: (diagnostic) => {
 			assertLive();
 			reported.diagnostics.push(copyJson(diagnostic, { omitUndefinedProperties: true }) as ToolDiagnostic);
@@ -239,8 +250,17 @@ async function run(
 
 	let result: ToolExecutionResult;
 	let ending = COMPLETED;
+	// Execution time of this attempt; a rerun after recovery measures only itself.
+	let durationMs: number | undefined;
 	try {
-		result = await tool.execute(args, api, context);
+		// Built for this call, so a rerun after recovery gets the conversation's environment at that time.
+		const env = await runtime.env(context);
+		const startedAt = performance.now();
+		try {
+			result = await tool.execute(args, { ...api, env }, context);
+		} finally {
+			durationMs = Math.round(performance.now() - startedAt);
+		}
 	} catch (error) {
 		if (runtime.signal.aborted) {
 			ended = true;
@@ -248,7 +268,7 @@ async function run(
 			throw error;
 		}
 		result = { isError: true, diagnostics: [toolDiagnostic("tool_error", errorText(error))] };
-		// A throw ends the task `failed`, which cancels what the call owned; it no longer supervises it. The error text
+		// A throw, from `execute()` or from building the environment, ends the task `failed`, which cancels what the call owned; it no longer supervises it. The error text
 		// is already in the result entry.
 		ending = { status: "failed", message: `Tool ${call.name} threw` };
 	}
@@ -258,7 +278,7 @@ async function run(
 	const pending = await progress.stop();
 	try {
 		const settled = await finalResult(runtime, call, result, reported, context);
-		await settle(runtime, call, ending, () => settled, context);
+		await settle(runtime, call, ending, () => settled, context, durationMs);
 	} catch (error) {
 		for (const waiter of pending) waiter.reject(error);
 		throw error;
@@ -315,6 +335,7 @@ function publishProgress(runtime: Runtime, reported: Reported, context: Context)
 			// Rejections after an abort mark or close are expected; the committed state stays consistent.
 			if (!runtime.signal.aborted) runtime.report(error);
 		},
+		runtime.settings.progress.outputIntervalMs,
 	);
 }
 
@@ -362,11 +383,12 @@ async function settle(
 	ending: Ending,
 	build: (slot: Readonly<ToolSlot> | undefined) => ToolExecutionResult,
 	context: Context,
+	durationMs?: number,
 ): Promise<void> {
 	await runtime.commit(async (tx) => {
 		const slot = toolSlot(await tx.doc(LiveDoc, runtime.conversationId), runtime.taskId);
 		const result = build(slot);
-		const entry = await appendToolResult(tx, runtime.conversationId, call, result, runtime.now());
+		const entry = await appendToolResult(tx, runtime.conversationId, call, result, runtime.now(), durationMs);
 		if (slot !== undefined) finishSlot(slot, entry.id);
 		const entryId = entry.id;
 		if (ending.status === "aborted")
@@ -438,6 +460,7 @@ export async function appendToolResult(
 	call: ToolCall,
 	result: ToolExecutionResult,
 	timestamp: number,
+	durationMs?: number,
 ): Promise<TypedEntry<{ diagnostics: ToolDiagnostic[] }>> {
 	const diagnostics = [...(result.diagnostics ?? [])];
 	const content: Content = [...(result.content ?? [])];
@@ -450,6 +473,7 @@ export async function appendToolResult(
 		...(result.details === undefined ? {} : { details: result.details }),
 		...(result.usage === undefined ? {} : { usage: result.usage }),
 		isError: result.isError ?? false,
+		...(durationMs === undefined ? {} : { durationMs }),
 		timestamp,
 	} as ToolResultMessage;
 	if (result.usage !== undefined) await recordUsage(tx, conversationId, "tools", call.name, result.usage);

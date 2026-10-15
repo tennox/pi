@@ -1,7 +1,7 @@
 import { fileURLToPath } from "node:url";
 import vm from "node:vm";
 import { afterEach, describe, expect, it } from "vitest";
-import { CodemodeSandbox, type CodemodeTool } from "../src/index.ts";
+import { CodemodeSandbox, type CodemodeTool, MAX_OUTPUT_CHARS, MAX_OUTPUT_ITEMS } from "../src/index.ts";
 import { PRELUDE_SOURCE } from "../src/runtime/prelude-source.ts";
 
 const sandboxes: CodemodeSandbox[] = [];
@@ -66,7 +66,7 @@ describe("script execution", () => {
 		`);
 		expect(result.ok).toBe(true);
 		expect(result.output.slice(0, -1)).toEqual([
-			{ type: "text", text: 'hello 1 {"a":1}' },
+			{ type: "text", text: 'hello 1 {"a":1}', console: true },
 			{ type: "text", text: '{"json":true}' },
 			{ type: "text", text: "undefined" },
 			{ type: "text", text: "7" },
@@ -77,7 +77,11 @@ describe("script execution", () => {
 			{ type: "image", data: WEBP, mimeType: "image/webp" },
 			{ type: "image", data: PNG, mimeType: "image/png" },
 		]);
-		expect(result.output.at(-1)).toMatchObject({ type: "text", text: expect.stringMatching(/^Error: bad/) });
+		expect(result.output.at(-1)).toMatchObject({
+			type: "text",
+			text: expect.stringMatching(/^Error: bad/),
+			console: true,
+		});
 	});
 
 	it("rejects invalid text() and image() arguments", async () => {
@@ -332,6 +336,22 @@ describe("tools", () => {
 		expect(aborted).toBe(true);
 	});
 
+	it("names close matches when a script reads a tool that does not exist", async () => {
+		const sandbox = createSandbox([echo, { name: "web-search", execute: () => "" }]);
+		const attempt = async (expression: string) => {
+			const result = await sandbox.execute(`return ${expression};`);
+			return result.ok ? result.value : result.error.message;
+		};
+		expect(await attempt("tools.Echo")).toBe(
+			'tools.Echo does not exist. Did you mean tools.echo? ALL_TOOLS lists every tool; searchTools(query) finds tools by topic. Check for a member with "Echo" in tools.',
+		);
+		expect(await attempt("tools.websearch")).toContain("Did you mean tools.web_search?");
+		expect(await attempt("tools.nothing")).toContain("Available: echo, web_search.");
+		expect(
+			await attempt("['echo' in tools, 'nothing' in tools, String(tools.toString), JSON.stringify(tools)]"),
+		).toEqual([true, false, "undefined", "{}"]);
+	});
+
 	it("supports register and unregister between executions", async () => {
 		const sandbox = createSandbox();
 		sandbox.registerTool(echo);
@@ -339,7 +359,7 @@ describe("tools", () => {
 		expect(sandbox.tools.map((tool) => tool.name)).toEqual(["echo"]);
 		expect(await sandbox.execute("return await tools.echo('a')")).toMatchObject({ ok: true, value: "a" });
 		expect(sandbox.unregisterTool("echo")).toBe(true);
-		expect(await sandbox.execute("return typeof tools.echo")).toMatchObject({ ok: true, value: "undefined" });
+		expect(await sandbox.execute("return 'echo' in tools")).toMatchObject({ ok: true, value: false });
 	});
 });
 
@@ -392,6 +412,15 @@ describe("store and load", () => {
 		});
 	});
 
+	it("explains oversized writes", async () => {
+		const sandbox = createSandbox();
+		const result = await sandbox.execute(`store("img", "x".repeat(300 * 1024));`);
+		expect(result.ok).toBe(false);
+		if (result.ok) return;
+		expect(result.error.message).toContain('store("img") value has 307202 characters of JSON');
+		expect(result.error.message).toContain("Show images with image()");
+	});
+
 	it("reserves the store and load names", () => {
 		const execute = () => undefined;
 		expect(() => new CodemodeSandbox({ globals: [{ name: "store", execute }] })).toThrow(/Invalid global/);
@@ -431,11 +460,28 @@ describe("globals", () => {
 			await models.list("classifier", undefined, 3);
 			await models.list();
 			try { models.extra = 1; } catch {}
-			return [Object.keys(models), await models.first("a", "ignored"), typeof models.extra];
+			return [Object.keys(models), await models.first("a", "ignored"), "extra" in models];
 		`);
-		expect(result).toMatchObject({ ok: true, value: [["list", "first"], "a", "undefined"] });
+		expect(result).toMatchObject({ ok: true, value: [["list", "first"], "a", false] });
 		// undefined array elements become null in the JSON round trip.
 		expect(seen).toEqual([["classifier", null, 3], []]);
+	});
+
+	it("names the members of a namespace when a script reads one that does not exist", async () => {
+		const execute = () => undefined;
+		const sandbox = new CodemodeSandbox({
+			globals: [
+				{ name: "models.classify", execute },
+				{ name: "models.generateImages", execute },
+			],
+		});
+		sandboxes.push(sandbox);
+		const result = await sandbox.execute("await models.generateImage();");
+		expect(result.ok).toBe(false);
+		if (result.ok) return;
+		expect(result.error.message).toBe(
+			'models.generateImage does not exist. Did you mean models.generateImages? Check for a member with "generateImage" in models.',
+		);
 	});
 
 	it("rejects invalid and reserved global names", () => {
@@ -536,6 +582,32 @@ describe("limits and lifetime", () => {
 		expect(await promise).toMatchObject({ ok: false, error: { kind: "aborted", message: "Sandbox closed" } });
 	});
 
+	// #10283: the host keeps all output, so a script that prints in a loop must not grow it without bound.
+	it("fails a script whose output passes the limits, even if it catches the error", async () => {
+		const sandbox = createSandbox();
+		for (const print of ["text(s)", "console.log(s)", 'image("data:image/png;base64," + p)']) {
+			const result = await sandbox.execute(`
+				const s = "x".repeat(1 << 20);
+				const p = "iVBORw0KGgoA" + "A".repeat(1 << 20);
+				for (;;) { try { ${print}; } catch {} }
+			`);
+			expect(result).toMatchObject({
+				ok: false,
+				error: { kind: "script", name: "RangeError", message: expect.stringContaining("script output exceeded") },
+			});
+			const chars = result.output.reduce(
+				(sum, item) => sum + (item.type === "text" ? item.text.length : item.data.length),
+				0,
+			);
+			expect(chars).toBeLessThanOrEqual(MAX_OUTPUT_CHARS);
+			expect(chars).toBeGreaterThan(MAX_OUTPUT_CHARS - (2 << 20));
+		}
+
+		const empty = await sandbox.execute(`for (;;) text("");`);
+		expect(empty).toMatchObject({ ok: false, error: { name: "RangeError" } });
+		expect(empty.output).toHaveLength(MAX_OUTPUT_ITEMS);
+	});
+
 	it("rejects execute after close", async () => {
 		const sandbox = createSandbox();
 		await sandbox.close();
@@ -582,6 +654,24 @@ describe("limits and lifetime", () => {
 			ok: false,
 			error: { kind: "sandbox", message: "Failed to load QuickJS: no wasm" },
 		});
+	});
+
+	// #10444: a malformed payload from the worker must fail the run as a sandbox error instead of
+	// throwing in the host's message listener and never settling.
+	it.each([
+		[{ type: "done", ok: true, value: "1", writes: "null" }, "store writes are not an array"],
+		[{ type: "done", ok: true, value: "1", writes: "[1]" }, "store writes contain a malformed entry"],
+		[{ type: "done", ok: true, value: "1", writes: '[["k", "{"]]' }, 'store value for "k" is not valid JSON'],
+		[{ type: "done", ok: true, value: "{", writes: "[]" }, "return value is not valid JSON"],
+		[{ type: "done", ok: false, error: "5" }, "script error is not an object"],
+		[{ type: "done", ok: false, error: "{}" }, "script error is malformed"],
+		[{ type: "nonsense" }, "unknown message from the worker"],
+	])("reports a broken bridge as a sandbox error: %j", async (message, reason) => {
+		const sandbox = new CodemodeSandbox({ workerUrl: new URL("./fixtures/raw-worker.ts", import.meta.url) });
+		sandboxes.push(sandbox);
+		const result = await sandbox.execute(JSON.stringify(message));
+		expect(result).toMatchObject({ ok: false, error: { kind: "sandbox" } });
+		expect(result.ok ? undefined : result.error.message).toContain(`Sandbox bridge broken: ${reason}`);
 	});
 });
 
@@ -634,14 +724,78 @@ describe("escape hatches", () => {
 		expect(result.value).not.toBe("imported");
 	});
 
+	// #10444: the prelude shares the built-ins with the script, so patching them could corrupt what
+	// the prelude sends to the host.
+	it("ignores patches to built-ins and built-in globals", async () => {
+		const sandbox = createSandbox([echo]);
+		const result = await sandbox.execute(`
+			Array.prototype.toJSON = () => null;
+			Object.prototype.toJSON = () => 5;
+			Promise.prototype.then = () => {};
+			Map.prototype.get = () => undefined;
+			globalThis.JSON = { stringify: () => "x", parse: () => "x" };
+			store("k", [1]);
+			return [await tools.echo([2]), JSON.stringify({ a: 1 })];
+		`);
+		expect(result).toMatchObject({ ok: true, value: [[2], '{"a":1}'], storeWrites: { set: { k: [1] } } });
+	});
+
+	it("freezes intrinsics that are only reachable from instances", async () => {
+		const sandbox = createSandbox();
+		const result = await sandbox.execute(`
+			return [
+				Object.getPrototypeOf(function* () {}).prototype,
+				Object.getPrototypeOf(async function () {}),
+				Object.getPrototypeOf(Int8Array).prototype,
+				Object.getPrototypeOf([][Symbol.iterator]()),
+				Object.getPrototypeOf(Object.getPrototypeOf([][Symbol.iterator]())),
+				Object.getPrototypeOf(new Map()[Symbol.iterator]()),
+				Object.getPrototypeOf(/a/[Symbol.matchAll]("")),
+			].every((object) => Object.isFrozen(object));
+		`);
+		expect(result).toMatchObject({ ok: true, value: true });
+	});
+
+	it("still lets instances override properties of frozen prototypes", async () => {
+		const sandbox = createSandbox();
+		const result = await sandbox.execute(`
+			const object = {};
+			object.toString = () => "custom";
+			function Legacy() {}
+			Legacy.prototype = Object.create(Error.prototype);
+			Legacy.prototype.constructor = Legacy;
+			const bare = new Error();
+			bare.message = "set later";
+			class MyError extends Error {
+				constructor(message) {
+					super(message);
+					this.name = "MyError";
+				}
+			}
+			let patched = "silent";
+			try { Error.prototype.name = "Patched"; } catch (error) { patched = error.constructor.name; }
+			return [String(object), new Legacy().constructor === Legacy, bare.message, new MyError("x").name, Error.prototype.name, patched];
+		`);
+		expect(result).toMatchObject({
+			ok: true,
+			value: ["custom", true, "set later", "MyError", "Error", "TypeError"],
+		});
+	});
+
+	it("reports errors whose name or message is not a string", async () => {
+		const sandbox = createSandbox();
+		const result = await sandbox.execute("const error = new Error('x'); error.message = 42; throw error;");
+		expect(result).toMatchObject({ ok: false, error: { kind: "script", name: "Error", message: "42" } });
+	});
+
 	it("keeps tools and console frozen", async () => {
 		const sandbox = createSandbox([echo]);
 		const result = await sandbox.execute(`
 			try { tools.echo = () => 'nope'; } catch {}
 			try { tools.extra = () => 'nope'; } catch {}
 			try { globalThis.tools = null; } catch {}
-			return [typeof tools.extra, await tools.echo('still')];
+			return ["extra" in tools, await tools.echo('still')];
 		`);
-		expect(result).toMatchObject({ ok: true, value: ["undefined", "still"] });
+		expect(result).toMatchObject({ ok: true, value: [false, "still"] });
 	});
 });
