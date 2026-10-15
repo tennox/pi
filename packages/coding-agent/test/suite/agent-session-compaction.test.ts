@@ -439,38 +439,27 @@ describe("AgentSession compaction characterization", () => {
 		]);
 	});
 
-	it("compacts and resumes after a length stop below the desired output limit", async () => {
+	it("aborts when an oversized prompt exceeds the raw context window, before any length stop can trigger", async () => {
+		// Replaces the previous incarnation of "compacts and resumes after a
+		// length stop below the desired output limit". That test relied on the
+		// provider receiving a request that exceeded contextWindow and then
+		// auto-recovering via overflow compaction; the pre-request
+		// context-exhaustion guard now rejects such requests up front, so the
+		// run ends cleanly with the structured error instead of completing.
 		const harness = await createHarness({
-			models: [{ id: "faux-1", contextWindow: 1000, maxTokens: 100 }],
+			models: [{ id: "faux-1", contextWindow: 200_000, maxTokens: 100 }],
 			settings: { compaction: { keepRecentTokens: 1, reserveTokens: 0 } },
-			extensionFactories: [
-				(pi) => {
-					pi.on("session_before_compact", async (event) => ({
-						compaction: {
-							summary: "overflow compacted",
-							firstKeptEntryId: event.preparation.firstKeptEntryId,
-							tokensBefore: event.preparation.tokensBefore,
-							details: {},
-						},
-					}));
-				},
-			],
 		});
 		harnesses.push(harness);
-		harness.setResponses([
-			fauxAssistantMessage("partial response", { stopReason: "length" }),
-			fauxAssistantMessage("completed response"),
-		]);
+		harness.setResponses([fauxAssistantMessage("never reached")]);
 
-		await harness.session.prompt("x".repeat(5000));
+		// 2_000_000 chars ≈ 500_000 tokens > contextWindow=200_000 → guard fires.
+		await harness.session.prompt("x".repeat(2_000_000));
 
-		expect(harness.faux.state.callCount).toBe(2);
-		expect(harness.eventsOfType("compaction_end").at(-1)).toMatchObject({
-			reason: "overflow",
-			aborted: false,
-			willRetry: true,
-		});
-		expect(harness.session.getLastAssistantText()).toBe("completed response");
+		expect(harness.faux.state.callCount).toBe(0);
+		expect(harness.session.agent.state.errorMessage).toMatch(
+			/context exhausted: ~\d+ tokens exceeds limit 200000 \u2014 run cancelled \(no automatic recovery\)/,
+		);
 	});
 
 	// Regression coverage for #8133: model overrides must also apply between assistant turns.
@@ -828,35 +817,26 @@ describe("AgentSession compaction characterization", () => {
 		);
 	});
 
-	it("compacts successful overflow responses without retrying", async () => {
+	it("aborts when a tiny context window cannot even hold the system sections", async () => {
+		// Replaces the previous incarnation of "compacts successful overflow
+		// responses without retrying", which used contextWindow: 1 to force any
+		// response to register as overflow. The pre-request context-exhaustion
+		// guard now catches that case upfront (the system-message sections alone
+		// are larger than the window) and ends the run cleanly with the
+		// structured error instead of recovering via overflow compaction.
 		const harness = await createHarness({
 			settings: { compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 0 } },
 			models: [{ id: "faux-1", contextWindow: 1, maxTokens: 100 }],
-			extensionFactories: [
-				(pi) => {
-					pi.on("session_before_compact", async (event) => ({
-						compaction: {
-							summary: "successful overflow compacted",
-							firstKeptEntryId: event.preparation.firstKeptEntryId,
-							tokensBefore: event.preparation.tokensBefore,
-							details: {},
-						},
-					}));
-				},
-			],
 		});
 		harnesses.push(harness);
-		harness.setResponses([fauxAssistantMessage("completed answer")]);
+		harness.setResponses([fauxAssistantMessage("never reached")]);
 
 		await expect(harness.session.prompt("hello")).resolves.toBeUndefined();
 
-		const compactionEnd = harness.eventsOfType("compaction_end").at(-1);
-		expect(compactionEnd).toMatchObject({
-			reason: "overflow",
-			aborted: false,
-			willRetry: false,
-		});
-		expect(harness.faux.state.callCount).toBe(1);
+		expect(harness.faux.state.callCount).toBe(0);
+		expect(harness.session.agent.state.errorMessage).toMatch(
+			/context exhausted: ~\d+ tokens exceeds limit 1 \u2014 run cancelled \(no automatic recovery\)/,
+		);
 	});
 
 	it("ignores stale pre-compaction assistant usage on pre-prompt checks", async () => {

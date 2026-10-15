@@ -128,10 +128,15 @@ describe("AgentSession actionable boundaries", () => {
 	it("keeps a boundary replacement verbatim through threshold compaction", async () => {
 		let handled = false;
 		const requests: string[] = [];
-		const instruction = "EXACT-REPLACEMENT-INSTRUCTION ".repeat(100);
+		// Replacement stays within the post-compaction budget; the historical
+		// content seeded below is what triggers threshold compaction. The
+		// previous incarnation used 100 repeats with contextWindow=2_000; that
+		// pattern no longer coexists with the pre-request context-exhaustion
+		// guard, which fires when the system sections alone exceed the window.
+		const instruction = "EXACT-REPLACEMENT-INSTRUCTION ".repeat(200);
 		const harness = await createHarness({
-			models: [{ id: "faux-1", contextWindow: 2_000, maxTokens: 100 }],
-			settings: { compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 0 } },
+			models: [{ id: "faux-1", contextWindow: 16_000, maxTokens: 100 }],
+			settings: { compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 14_500 } },
 			extensionFactories: [
 				(pi) => {
 					pi.on("turn_end", (event, ctx) => {
@@ -161,8 +166,14 @@ describe("AgentSession actionable boundaries", () => {
 			],
 		});
 		harnesses.push(harness);
-		harness.sessionManager.appendMessage({ role: "user", content: "older input", timestamp: Date.now() - 2 });
-		harness.sessionManager.appendMessage(fauxAssistantMessage("older answer", { timestamp: Date.now() - 1 }));
+		harness.sessionManager.appendMessage({
+			role: "user",
+			content: "older input".padEnd(40_000, "o"),
+			timestamp: Date.now() - 2,
+		});
+		harness.sessionManager.appendMessage(
+			fauxAssistantMessage("older answer".padEnd(40_000, "a"), { timestamp: Date.now() - 1 }),
+		);
 		harness.session.refreshContext();
 		harness.setResponses([
 			fauxAssistantMessage("answered original input"),
@@ -184,8 +195,8 @@ describe("AgentSession actionable boundaries", () => {
 		const requests: string[] = [];
 		const instruction = "EXACT-UNSENT-INSTRUCTION ".repeat(100);
 		const harness = await createHarness({
-			models: [{ id: "faux-1", contextWindow: 2_000, maxTokens: 100 }],
-			settings: { compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 0 } },
+			models: [{ id: "faux-1", contextWindow: 16_000, maxTokens: 100 }],
+			settings: { compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 14_000 } },
 			extensionFactories: [
 				(pi) => {
 					pi.on("turn_end", () => {
@@ -223,7 +234,7 @@ describe("AgentSession actionable boundaries", () => {
 			},
 		]);
 
-		await harness.session.prompt("old input ".repeat(500));
+		await harness.session.prompt("old input ".repeat(5000));
 
 		expect(harness.eventsOfType("compaction_start").length).toBeGreaterThan(0);
 		expect(requests).toHaveLength(1);
@@ -506,7 +517,7 @@ describe("AgentSession actionable boundaries", () => {
 	it("does not compact from usage belonging to a boundary-omitted assistant", async () => {
 		let handled = false;
 		const harness = await createHarness({
-			models: [{ id: "faux-1", contextWindow: 10_000, maxTokens: 100 }],
+			models: [{ id: "faux-1", contextWindow: 16_000, maxTokens: 100 }],
 			settings: { compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 300 } },
 			extensionFactories: [
 				(pi) => {
@@ -541,7 +552,7 @@ describe("AgentSession actionable boundaries", () => {
 	it("does not trigger successful-response overflow from usage captured before a boundary edit", async () => {
 		let handled = false;
 		const harness = await createHarness({
-			models: [{ id: "faux-1", contextWindow: 5_000, maxTokens: 100 }],
+			models: [{ id: "faux-1", contextWindow: 16_000, maxTokens: 100 }],
 			settings: { compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 0 } },
 			extensionFactories: [
 				(pi) => {
@@ -577,7 +588,7 @@ describe("AgentSession actionable boundaries", () => {
 
 	it("does not trigger threshold compaction from post-edit usage captured before a later compaction", async () => {
 		const harness = await createHarness({
-			models: [{ id: "faux-1", contextWindow: 10_000, maxTokens: 100 }],
+			models: [{ id: "faux-1", contextWindow: 16_000, maxTokens: 100 }],
 			settings: { compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 0 } },
 		});
 		harnesses.push(harness);
@@ -786,7 +797,7 @@ describe("durable length recovery", () => {
 			execute: async () => ({ content: [{ type: "text", text: "done" }], details: {} }),
 		};
 		const harness = await createHarness({
-			models: [{ id: "faux-1", contextWindow: 1000, maxTokens: 100 }],
+			models: [{ id: "faux-1", contextWindow: 16_000, maxTokens: 100 }],
 			settings: { compaction: { keepRecentTokens: 1, reserveTokens: 0 } },
 			tools: [tool],
 			extensionFactories: [
@@ -829,7 +840,7 @@ describe("durable length recovery", () => {
 	it("gives a distinct queued follow-up its own length-recovery budget", async () => {
 		let queued = false;
 		const harness = await createHarness({
-			models: [{ id: "faux-1", contextWindow: 1000, maxTokens: 100 }],
+			models: [{ id: "faux-1", contextWindow: 16_000, maxTokens: 100 }],
 			settings: { compaction: { keepRecentTokens: 1, reserveTokens: 0 } },
 			extensionFactories: [
 				(pi) => {
@@ -894,7 +905,7 @@ describe("durable length recovery", () => {
 
 	it("omits a recoverable projected replacement by its source entry ID", async () => {
 		const harness = await createHarness({
-			models: [{ id: "faux-1", contextWindow: 1_000, maxTokens: 100 }],
+			models: [{ id: "faux-1", contextWindow: 16_000, maxTokens: 100 }],
 			settings: { compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 0 } },
 			extensionFactories: [
 				(pi) => {
@@ -930,7 +941,7 @@ describe("durable length recovery", () => {
 		let replaced = false;
 		let overflowId: string | undefined;
 		const harness = await createHarness({
-			models: [{ id: "faux-1", contextWindow: 1_000, maxTokens: 100 }],
+			models: [{ id: "faux-1", contextWindow: 16_000, maxTokens: 100 }],
 			settings: { compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 0 } },
 			extensionFactories: [
 				(pi) => {
@@ -1032,7 +1043,7 @@ describe("durable length recovery", () => {
 
 	it("keeps omissions and does not retry when recovery compaction fails", async () => {
 		const harness = await createHarness({
-			models: [{ id: "faux-1", contextWindow: 1000, maxTokens: 100 }],
+			models: [{ id: "faux-1", contextWindow: 16_000, maxTokens: 100 }],
 			settings: {
 				compaction: { keepRecentTokens: 1, reserveTokens: 0 },
 				retry: { enabled: false, maxRetries: 0, baseDelayMs: 1 },

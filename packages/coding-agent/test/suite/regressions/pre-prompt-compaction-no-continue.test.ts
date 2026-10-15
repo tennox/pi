@@ -25,8 +25,13 @@ describe("pre-prompt compaction regression", () => {
 
 	it("compacts length-stop overflow before a new prompt without continuing from an assistant message", async () => {
 		const harness = await createHarness({
-			models: [{ id: "faux-1", contextWindow: 100, maxTokens: 100 }],
-			settings: { compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 0 } },
+			// Realistic contextWindow; the previous incarnation used
+			// contextWindow: 100 which is smaller than the system-message
+			// sections alone (~1.4k tokens) and so the pre-request
+			// context-exhaustion guard rejects every request before overflow
+			// compaction can run.
+			models: [{ id: "faux-1", contextWindow: 200_000, maxTokens: 100 }],
+			settings: { compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 16_384 } },
 			extensionFactories: [
 				(pi) => {
 					pi.on("session_before_compact", async (event) => ({
@@ -46,7 +51,7 @@ describe("pre-prompt compaction regression", () => {
 		const model = harness.getModel();
 		harness.sessionManager.appendMessage({
 			role: "user",
-			content: [{ type: "text", text: "previous prompt" }],
+			content: [{ type: "text", text: "previous prompt".padEnd(2000, "p") }],
 			timestamp: now - 1000,
 		});
 		const lengthStopAssistant: AssistantMessage = {
@@ -54,7 +59,7 @@ describe("pre-prompt compaction regression", () => {
 			api: model.api,
 			provider: model.provider,
 			model: model.id,
-			usage: createUsage(100),
+			usage: createUsage(200_000),
 		};
 		harness.sessionManager.appendMessage(lengthStopAssistant);
 		harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;

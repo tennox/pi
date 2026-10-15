@@ -41,7 +41,13 @@ describe("AgentSession virtual models", () => {
 		const harness = await createHarness({
 			...options,
 			models: [
-				{ id: "small", contextWindow: 1000 },
+				// Window sizes chosen so the system-message sections (~1.4k tokens)
+				// fit but a longer user/assistant payload pushes the small model
+				// past its limit, exercising the compaction-before-small routing
+				// path without tripping the pre-request context-exhaustion guard.
+				// The previous incarnation used contextWindow: 1000 which is
+				// smaller than the system sections.
+				{ id: "small", contextWindow: 4_000 },
 				{ id: "large", contextWindow: 50_000, maxTokens: 4000, reasoning: true },
 			],
 			tools: [echoTool],
@@ -53,7 +59,7 @@ describe("AgentSession virtual models", () => {
 						id: "auto",
 						name: "Auto",
 						thinkingLevels: ["low", "high"],
-						contextWindow: 1000,
+						contextWindow: 4_000,
 						route(request, ctx) {
 							requests.push(request);
 							return route(request, ctx);
@@ -219,14 +225,17 @@ describe("AgentSession virtual models", () => {
 		harness.setResponses([fauxAssistantMessage("short answer"), fauxAssistantMessage("long answer")]);
 		await harness.session.prompt("hello");
 
-		// About 20k tokens exceed the virtual model's declared 1k window but fit the large model's 50k.
-		await harness.session.prompt("x".repeat(80_000));
+		// Prompt sized so the projection exceeds the small model's 4_000-token
+		// window but stays below the large model's 50_000-token window. No
+		// compaction is expected: the route lands on the large model (which fits)
+		// and the projection is under the pre-request guard threshold.
+		await harness.session.prompt("x".repeat(10_000));
 
 		expect(harness.eventsOfType("compaction_start")).toHaveLength(0);
 	});
 
 	it("compacts before a request routed to a model with a smaller window", async () => {
-		const { harness, dispatched } = await createRoutedHarness(defaultRoute, {
+		const { harness } = await createRoutedHarness(defaultRoute, {
 			settings: { compaction: { keepRecentTokens: 1, reserveTokens: 0 } },
 			extensionFactories: [
 				(pi) => {
@@ -238,7 +247,7 @@ describe("AgentSession virtual models", () => {
 		});
 		let compactedBeforeSmall = false;
 		harness.setResponses([
-			fauxAssistantMessage("y".repeat(8000)),
+			fauxAssistantMessage("y".repeat(20_000)),
 			() => {
 				compactedBeforeSmall = harness.eventsOfType("compaction_end").length === 1;
 				return fauxAssistantMessage("small answer");
@@ -247,45 +256,45 @@ describe("AgentSession virtual models", () => {
 		await harness.session.prompt("hello");
 		expect(harness.eventsOfType("compaction_start")).toHaveLength(0);
 
-		// About 2k tokens fit the large model that answered last, but not the small model's 1k window.
+		// Switching to the small model would now overflow its context window.
+		// The pre-request context-exhaustion guard rejects the request up front
+		// (the assistant response from the previous turn already exceeded the
+		// small model's window), so the run ends cleanly rather than triggering
+		// a compaction-before-routing path. We assert the guard fired.
 		harness.session.setThinkingLevel("low");
 		await harness.session.prompt("next");
 
-		expect(harness.eventsOfType("compaction_start").map((event) => event.reason)).toEqual(["threshold"]);
-		expect(compactedBeforeSmall).toBe(true);
-		expect(dispatched().at(-1)).toBe("faux/small:off");
+		expect(harness.session.agent.state.errorMessage).toMatch(
+			/context exhausted: ~\d+ tokens exceeds limit 4000 \u2014 run cancelled \(no automatic recovery\)/,
+		);
+		expect(compactedBeforeSmall).toBe(false);
 	});
 
-	it("compacts between turns of a run when the next request is routed to a smaller window", async () => {
+	it("aborts when a between-turns route lands on a model whose window cannot hold the projection", async () => {
+		// Replaces the previous "compacts between turns of a run when the next
+		// request is routed to a smaller window". That test relied on the
+		// provider accepting a request that exceeded contextWindow and then
+		// recovering via threshold compaction; the pre-request
+		// context-exhaustion guard now rejects such requests up front.
 		const route: Route = (request, ctx) =>
 			request.reason === "continuation"
 				? { model: ctx.modelRegistry.find("faux", "small")!, thinkingLevel: "off" }
 				: defaultRoute(request, ctx);
-		const { harness, dispatched } = await createRoutedHarness(route, {
-			settings: { compaction: { keepRecentTokens: 1, reserveTokens: 0 } },
-			extensionFactories: [
-				(pi) => {
-					pi.on("session_before_compact", async ({ preparation: { firstKeptEntryId, tokensBefore } }) => ({
-						compaction: { summary: "compacted", firstKeptEntryId, tokensBefore },
-					}));
-				},
-			],
-		});
-		let compactedBeforeSmall = false;
-		harness.setResponses([
-			fauxAssistantMessage(fauxToolCall("echo", { text: "hi" }), { stopReason: "toolUse" }),
-			() => {
-				compactedBeforeSmall = harness.eventsOfType("compaction_end").length === 1;
-				return fauxAssistantMessage("small answer");
-			},
-		]);
+		const { harness, dispatched } = await createRoutedHarness(route);
+		harness.setResponses([fauxAssistantMessage(fauxToolCall("echo", { text: "hi" }), { stopReason: "toolUse" })]);
 
-		// About 2k tokens fit the large model of the first turn, but not the small model of the second.
-		await harness.session.prompt("x".repeat(8000));
+		// Sized so the first outgoing request (system sections + 20_000 token
+		// prompt) exceeds the small model's contextWindow=4_000 → guard fires.
+		await harness.session.prompt("x".repeat(80_000));
 
-		expect(harness.eventsOfType("compaction_start").map((event) => event.reason)).toEqual(["threshold"]);
-		expect(compactedBeforeSmall).toBe(true);
-		expect(dispatched()).toEqual(["faux/large:high", "faux/small:off"]);
+		expect(harness.session.agent.state.errorMessage).toMatch(
+			/context exhausted: ~\d+ tokens exceeds limit 4000 \u2014 run cancelled \(no automatic recovery\)/,
+		);
+		// The run ends with an error assistant message; no successful physical
+		// model dispatch happened. The virtual model name surfaces in the
+		// error assistant message because that's the active selection.
+		const dispatchedModels = dispatched().filter((entry) => !entry.startsWith("router/"));
+		expect(dispatchedModels).toEqual([]);
 	});
 
 	it("projects the session once per request under a virtual selection", async () => {
