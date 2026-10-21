@@ -53,7 +53,7 @@ beforeEach(() => {
 	originalWrite = process.stdout.write.bind(process.stdout);
 	process.stdout.write = ((...args: Parameters<typeof process.stdout.write>) => {
 		const [chunk] = args;
-		if (typeof chunk === "string" && chunk.startsWith("\x1b]52;c;")) {
+		if (typeof chunk === "string" && chunk.startsWith("\x1b]52;")) {
 			osc52Writes.push(chunk);
 			return true;
 		}
@@ -301,5 +301,48 @@ describe("copyToClipboard", () => {
 			"Clipboard unavailable: text exceeds the OSC 52 size limit",
 		);
 		expect(osc52Writes).toHaveLength(0);
+	});
+	test("Linux Wayland writes the primary selection through wl-copy --primary", async () => {
+		mocks.platform.mockReturnValue("linux");
+		vi.stubEnv("WAYLAND_DISPLAY", "wayland-0");
+		await copyToClipboard("hello", "primary");
+		expect(mocks.command).toHaveBeenCalledExactlyOnceWith("wl-copy", ["--primary"], {
+			input: "hello",
+			timeoutMs: 5000,
+		});
+		expect(osc52Writes).toHaveLength(0);
+	});
+	test("Linux X11 writes the primary selection through xclip, then xsel", async () => {
+		mocks.platform.mockReturnValue("linux");
+		vi.stubEnv("DISPLAY", ":0");
+		mocks.command.mockImplementation(async (name) => (name === "xsel" ? Buffer.alloc(0) : undefined));
+		await copyToClipboard("hello", "primary");
+		expect(mocks.command.mock.calls.map(([name, args]) => [name, args])).toEqual([
+			["xclip", ["-selection", "primary"]],
+			["xsel", ["--primary", "--input"]],
+		]);
+		expect(osc52Writes).toHaveLength(0);
+	});
+	test("display-less Linux emits a primary-target OSC 52", async () => {
+		mocks.platform.mockReturnValue("linux");
+		await copyToClipboard("hello", "primary");
+		expect(mocks.command).not.toHaveBeenCalled();
+		expect(osc52Writes).toHaveLength(1);
+		expect(osc52Writes[0].startsWith("\x1b]52;p;")).toBe(true);
+	});
+	test("macOS falls back to the regular clipboard for the primary target", async () => {
+		await copyToClipboard("hello", "primary");
+		expect(mocks.clipboard.setText).toHaveBeenCalledWith("hello");
+		expect(mocks.command).not.toHaveBeenCalled();
+		expect(osc52Writes).toHaveLength(0);
+	});
+	test("WSL falls back to the clipboard OSC 52 target for the primary selection", async () => {
+		mocks.platform.mockReturnValue("linux");
+		vi.stubEnv("WSL_DISTRO_NAME", "Ubuntu");
+		vi.stubEnv("WT_SESSION", "session");
+		await copyToClipboard("hello", "primary");
+		expect(mocks.command).not.toHaveBeenCalled();
+		expect(osc52Writes).toHaveLength(1);
+		expect(osc52Writes[0].startsWith("\x1b]52;c;")).toBe(true);
 	});
 });

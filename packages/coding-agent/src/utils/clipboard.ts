@@ -8,16 +8,19 @@ import { isWSL } from "./wsl.ts";
 
 const MAX_OSC52_ENCODED_LENGTH = 100_000;
 
+/** Clipboard flavor to write: the regular CLIPBOARD selection, or the X11/Wayland PRIMARY selection (middle-click paste). */
+export type ClipboardTarget = "clipboard" | "primary";
+
 function isRemoteSession(env: NodeJS.ProcessEnv): boolean {
 	return Boolean(env.SSH_CONNECTION || env.SSH_CLIENT || env.MOSH_CONNECTION);
 }
 
-function emitOsc52(text: string): boolean {
+function emitOsc52(text: string, selection: "c" | "p"): boolean {
 	const encoded = Buffer.from(text).toString("base64");
 	if (encoded.length > MAX_OSC52_ENCODED_LENGTH) {
 		return false;
 	}
-	process.stdout.write(`\x1b]52;c;${encoded}\x07`);
+	process.stdout.write(`\x1b]52;${selection};${encoded}\x07`);
 	return true;
 }
 
@@ -78,9 +81,17 @@ export async function readClipboardFilePaths(): Promise<string[] | null> {
 	return paths?.length ? paths : null;
 }
 
-export async function copyToClipboard(text: string): Promise<void> {
+/**
+ * Copy text to the system clipboard. `target` selects the X11/Wayland PRIMARY selection on
+ * Linux; platforms without a primary selection (macOS, Windows, Termux, WSL) fall back to the
+ * regular clipboard.
+ */
+export async function copyToClipboard(text: string, target: ClipboardTarget = "clipboard"): Promise<void> {
 	const p = platform();
 	const env = process.env;
+	// Only Linux has a PRIMARY selection; WSL routes its clipboard to Windows.
+	const primary = target === "primary" && p === "linux" && !isWSL(env);
+	const osc52Selection = primary ? "p" : "c";
 	let copied = false;
 	// Direct writes precede OSC 52 so the terminal cannot race the native writer.
 	// Linux tools retain clipboard selection ownership after this call returns.
@@ -101,9 +112,12 @@ export async function copyToClipboard(text: string): Promise<void> {
 		else if (p === "win32") commands.push(["clip", []]);
 		else {
 			if (env.TERMUX_VERSION) commands.push(["termux-clipboard-set", []]);
-			if (env.WAYLAND_DISPLAY) commands.push(["wl-copy", []]);
+			if (env.WAYLAND_DISPLAY) commands.push(["wl-copy", primary ? ["--primary"] : []]);
 			if (env.DISPLAY) {
-				commands.push(["xclip", ["-selection", "clipboard"]], ["xsel", ["--clipboard", "--input"]]);
+				commands.push(
+					["xclip", ["-selection", primary ? "primary" : "clipboard"]],
+					["xsel", primary ? ["--primary", "--input"] : ["--clipboard", "--input"]],
+				);
 			}
 		}
 		for (const [command, args] of commands) {
@@ -116,7 +130,7 @@ export async function copyToClipboard(text: string): Promise<void> {
 	let osc52Emitted = false;
 	if (!copied && p === "linux" && isWSL(env)) {
 		// Windows Terminal supports OSC 52; prefer it over the slower PowerShell round trip.
-		if (env.WT_SESSION) osc52Emitted = emitOsc52(text);
+		if (env.WT_SESSION) osc52Emitted = emitOsc52(text, osc52Selection);
 		copied = osc52Emitted || (await copyViaWindowsClipboard(text));
 	}
 	// OSC 52 cannot be verified, so a desktop session with a display reports the failure
@@ -125,7 +139,7 @@ export async function copyToClipboard(text: string): Promise<void> {
 	const headless = p === "linux" && !env.DISPLAY && !env.WAYLAND_DISPLAY && !env.TERMUX_VERSION;
 	let oversized = false;
 	if (!osc52Emitted && (isRemoteSession(env) || (!copied && headless))) {
-		if (emitOsc52(text)) copied = true;
+		if (emitOsc52(text, osc52Selection)) copied = true;
 		else oversized = true;
 	}
 	if (copied) return;

@@ -513,24 +513,32 @@ describe("SettingsManager", () => {
 		expect(manager.getFullscreenExitOutput()).toBe("transcript");
 		expect(manager.getFullscreenScrollbar()).toBe("auto");
 		expect(manager.getFullscreenCopyOnSelect()).toBe(true);
+		expect(manager.getFullscreenCopyOnSelectTarget()).toBe("clipboard");
 
 		manager.setFullscreenExitOutput("resume-hint");
 		manager.setFullscreenScrollbar("hidden");
 		manager.setFullscreenCopyOnSelect(false);
+		manager.setFullscreenCopyOnSelectTarget("primary");
 		await manager.flush();
 		const savedSettings = JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf-8"));
 		expect(savedSettings.fullscreenExitOutput).toBe("resume-hint");
 		expect(savedSettings.fullscreenScrollbar).toBe("hidden");
 		expect(savedSettings.fullscreenCopyOnSelect).toBe(false);
+		expect(savedSettings.fullscreenCopyOnSelectTarget).toBe("primary");
 
 		writeFileSync(
 			join(agentDir, "settings.json"),
-			JSON.stringify({ fullscreenExitOutput: "nothing", fullscreenScrollbar: "sometimes" }),
+			JSON.stringify({
+				fullscreenExitOutput: "nothing",
+				fullscreenScrollbar: "sometimes",
+				fullscreenCopyOnSelectTarget: "sometimes",
+			}),
 		);
 		const reloadedManager = SettingsManager.create(projectDir, agentDir);
 		expect(reloadedManager.getFullscreenExitOutput()).toBe("transcript");
 		expect(reloadedManager.getFullscreenScrollbar()).toBe("auto");
 		expect(reloadedManager.getFullscreenCopyOnSelect()).toBe(true);
+		expect(reloadedManager.getFullscreenCopyOnSelectTarget()).toBe("clipboard");
 	});
 
 	// #9758: wheel scrolling defaults to auto, persists line counts, and ignores invalid values.

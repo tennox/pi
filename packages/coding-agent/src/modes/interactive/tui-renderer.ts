@@ -1,5 +1,6 @@
 import type { Terminal, WheelScrollLines } from "@earendil-works/pi-tui";
 import { ProcessTerminal, type TUI, TuiAltScreen, TuiMainScreen } from "@earendil-works/pi-tui";
+import type { FullscreenCopyOnSelectTarget } from "../../core/settings-manager.ts";
 import { copyToClipboard } from "../../utils/clipboard.ts";
 import { openBrowser } from "../../utils/open-browser.ts";
 import { keyDisplayText } from "./components/keybinding-hints.ts";
@@ -12,6 +13,7 @@ export interface InteractiveTuiOptions {
 	readonly terminal?: Terminal;
 	readonly onRightClickPaste?: () => void;
 	readonly fullscreenCopyOnSelect?: boolean;
+	readonly fullscreenCopyOnSelectTarget?: FullscreenCopyOnSelectTarget;
 	readonly fullscreenWheelScrollLines?: WheelScrollLines;
 }
 
@@ -38,7 +40,7 @@ export function createInteractiveTui(options: InteractiveTuiOptions): TuiMainScr
 			wheelScrollLines: options.fullscreenWheelScrollLines ?? "auto",
 			copySelection: async (text) => {
 				try {
-					await copyToClipboard(text);
+					await copyToClipboard(text, options.fullscreenCopyOnSelectTarget ?? "clipboard");
 					return true;
 				} catch (error) {
 					return error instanceof Error ? error.message : String(error);

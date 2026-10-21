@@ -95,6 +95,7 @@ See [Compaction Reference](compaction.md) for trigger, summarization, and valida
 | `fullscreenExitOutput` | `"transcript" \| "resume-hint"` | `"transcript"` | Output printed when fullscreen mode exits. |
 | `fullscreenScrollbar` | `"auto" \| "always" \| "hidden"` | `"auto"` | Fullscreen transcript scrollbar behavior. |
 | `fullscreenCopyOnSelect` | boolean | `true` | Copy selected text automatically in fullscreen mode. |
+| `fullscreenCopyOnSelectTarget` | `"clipboard" \| "primary"` | `"clipboard"` | Where selected text is copied in fullscreen mode. `"primary"` writes the X11/Wayland PRIMARY selection (middle-click paste) on Linux; macOS, Windows, Termux, and WSL have no primary selection and use the regular clipboard. Explicit copies (copy message, `/tree` copy, auth-URL copy) always use the clipboard. |
 | `fullscreenWheelScrollLines` | `"auto"` \| number | `"auto"` | Lines per mouse-wheel event in fullscreen mode, from 1 to 100. `"auto"` moves one line per event in local macOS terminals, which already accelerate wheel and trackpad input; elsewhere, and over SSH, it speeds up fast wheel spins to at most 6 lines per event. Alt+wheel moves five times as far. |
 | `editorPaddingX` | number | `0` | Horizontal editor padding from 0 to 3 cells. |
 | `outputPad` | `0 \| 1` | `1` | Horizontal transcript padding for messages, tool output, `!` command output, and summary blocks. |
