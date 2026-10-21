@@ -33,6 +33,8 @@ function makeContext(overrides: Partial<ToolRenderContext> = {}): ToolRenderCont
 		executionStarted: true,
 		argsComplete: true,
 		isPartial: false,
+		durationMs: undefined,
+		outputPad: 0,
 		expanded: false,
 		showImages: false,
 		isError: false,
