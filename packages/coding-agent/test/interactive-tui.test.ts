@@ -20,7 +20,7 @@ import {
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
 
 const clipboardMocks = vi.hoisted(() => ({
-	copyToClipboard: vi.fn<(text: string) => Promise<void>>(),
+	copyToClipboard: vi.fn<(text: string, target?: "clipboard" | "primary") => Promise<void>>(),
 	readClipboardFilePaths: vi.fn<() => Promise<string[] | null>>(),
 	readClipboardText: vi.fn<() => Promise<string | null>>(),
 }));
@@ -131,6 +131,7 @@ describe("createInteractiveTui", () => {
 				session: {
 					settingsManager: {
 						getFullscreenCopyOnSelect: () => boolean;
+						getFullscreenCopyOnSelectTarget: () => "clipboard" | "primary";
 						getFullscreenWheelScrollLines: () => WheelScrollLines;
 					};
 				};
@@ -145,7 +146,11 @@ describe("createInteractiveTui", () => {
 		const context = Object.assign(Object.create(InteractiveMode.prototype), {
 			runtimeHost: {
 				session: {
-					settingsManager: { getFullscreenCopyOnSelect: () => true, getFullscreenWheelScrollLines: () => "auto" },
+					settingsManager: {
+						getFullscreenCopyOnSelect: () => true,
+						getFullscreenCopyOnSelectTarget: () => "clipboard" as const,
+						getFullscreenWheelScrollLines: () => "auto",
+					},
 				},
 			},
 			renderer,
@@ -256,11 +261,49 @@ describe("InteractiveMode copy confirmation", () => {
 			await terminal.waitForRender();
 
 			expect(clipboardMocks.copyToClipboard).toHaveBeenCalledOnce();
-			expect(clipboardMocks.copyToClipboard).toHaveBeenCalledWith("alpha\nbeta");
+			expect(clipboardMocks.copyToClipboard).toHaveBeenCalledWith("alpha\nbeta", "clipboard");
 			expect(getLastAssistantText).not.toHaveBeenCalled();
 			expect(showStatus).not.toHaveBeenCalled();
 			expect(showError).not.toHaveBeenCalled();
 			expect(terminal.getViewport().some((line) => line.includes("Copied!"))).toBe(true);
+		} finally {
+			ui.stop();
+		}
+	});
+
+	it("copies the fullscreen selection to the primary selection when configured", async () => {
+		const terminal = new RecordingTerminal(40, 4);
+		const ui = createInteractiveTui({
+			tuiMode: "fullscreen",
+			showHardwareCursor: false,
+			logDirectory: "/tmp",
+			terminal,
+			fullscreenCopyOnSelect: false,
+			fullscreenCopyOnSelectTarget: "primary",
+		});
+		const showStatus = vi.fn();
+		const showError = vi.fn();
+		const context: CopyCommandContext = {
+			session: { getLastAssistantText: vi.fn(() => "assistant response") },
+			ui,
+			showStatus,
+			showError,
+		};
+		ui.addChild(new Text("alpha\nbeta\ngamma\ndelta", 0, 0));
+
+		ui.start();
+		try {
+			await terminal.waitForRender();
+			terminal.sendInput("\x1b[<0;1;1M");
+			terminal.sendInput("\x1b[<32;4;2M");
+			terminal.sendInput("\x1b[<0;4;2m");
+			await terminal.waitForRender();
+			clipboardMocks.copyToClipboard.mockClear();
+
+			await copyCommandPrototype.handleCopyCommand.call(context, { flashConfirmation: true, preferSelection: true });
+
+			expect(clipboardMocks.copyToClipboard).toHaveBeenCalledOnce();
+			expect(clipboardMocks.copyToClipboard).toHaveBeenCalledWith("alpha\nbeta", "primary");
 		} finally {
 			ui.stop();
 		}

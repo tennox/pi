@@ -53,6 +53,7 @@ export interface RetrySettings {
 
 export type TuiMode = RendererTuiMode;
 export type FullscreenExitOutput = "transcript" | "resume-hint";
+export type FullscreenCopyOnSelectTarget = "clipboard" | "primary";
 
 export interface TerminalSettings {
 	showImages?: boolean; // default: true (only relevant if terminal supports images)
@@ -185,6 +186,7 @@ export interface Settings {
 	fullscreenExitOutput?: FullscreenExitOutput; // default: "transcript"; no effect in regular TUI mode
 	fullscreenScrollbar?: ScrollViewScrollbar; // default: "auto"; no effect in regular TUI mode
 	fullscreenCopyOnSelect?: boolean; // default: true; no effect in regular TUI mode
+	fullscreenCopyOnSelectTarget?: FullscreenCopyOnSelectTarget; // default: "clipboard"; "primary" copies mouse selections to the X11/Wayland PRIMARY selection (middle-click paste) on Linux; platforms without a primary selection (macOS, Windows, Termux, WSL) use the clipboard; no effect in regular TUI mode
 	fullscreenWheelScrollLines?: WheelScrollLines; // default: "auto"; lines per wheel event, 1-100
 }
 
@@ -1406,6 +1408,16 @@ export class SettingsManager {
 	setFullscreenCopyOnSelect(enabled: boolean): void {
 		this.globalSettings.fullscreenCopyOnSelect = enabled;
 		this.markModified("fullscreenCopyOnSelect");
+		this.save();
+	}
+
+	getFullscreenCopyOnSelectTarget(): FullscreenCopyOnSelectTarget {
+		return this.settings.fullscreenCopyOnSelectTarget === "primary" ? "primary" : "clipboard";
+	}
+
+	setFullscreenCopyOnSelectTarget(target: FullscreenCopyOnSelectTarget): void {
+		this.globalSettings.fullscreenCopyOnSelectTarget = target;
+		this.markModified("fullscreenCopyOnSelectTarget");
 		this.save();
 	}
 
