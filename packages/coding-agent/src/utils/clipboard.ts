@@ -11,8 +11,13 @@ const MAX_OSC52_ENCODED_LENGTH = 100_000;
 /** Clipboard flavor to write: the regular CLIPBOARD selection, or the X11/Wayland PRIMARY selection (middle-click paste). */
 export type ClipboardTarget = "clipboard" | "primary";
 
+/**
+ * Remote sessions also emit OSC 52 so the client terminal receives the copy. PI_CLIPBOARD_OSC52=1
+ * covers remote clients that leave no SSH markers, such as multiplexer attaches (#10114, #10835)
+ * or IDE daemons (#10826).
+ */
 function isRemoteSession(env: NodeJS.ProcessEnv): boolean {
-	return Boolean(env.SSH_CONNECTION || env.SSH_CLIENT || env.MOSH_CONNECTION);
+	return Boolean(env.SSH_CONNECTION || env.SSH_CLIENT || env.MOSH_CONNECTION || env.PI_CLIPBOARD_OSC52 === "1");
 }
 
 function emitOsc52(text: string, selection: "c" | "p"): boolean {
