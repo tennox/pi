@@ -9,8 +9,13 @@
  * sees the cap and can recover on the next turn.
  */
 
-import type { AssistantMessage, AssistantMessageEvent, Message, Model, UserMessage } from "@earendil-works/pi-ai";
-import { EventStream } from "@earendil-works/pi-ai";
+import {
+	type AssistantMessage,
+	createAssistantMessageEventStream,
+	type Message,
+	type Model,
+	type UserMessage,
+} from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { agentLoop } from "../src/agent-loop.ts";
@@ -19,19 +24,6 @@ import type { AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentTool
 // ---------------------------------------------------------------------------
 // Helpers (kept minimal; the parent test file's helpers are not exported).
 // ---------------------------------------------------------------------------
-
-class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
-	constructor() {
-		super(
-			(event) => event.type === "done" || event.type === "error",
-			(event) => {
-				if (event.type === "done") return event.message;
-				if (event.type === "error") return event.error;
-				throw new Error("Unexpected event type");
-			},
-		);
-	}
-}
 
 function createUsage() {
 	return {
@@ -150,7 +142,7 @@ describe("parallel tool-call cap (PI_MAX_PARALLEL_TOOL_CALLS)", () => {
 		let llmCalls = 0;
 		const stream = agentLoop([createUserMessage("do a lot")], context, config, undefined, () => {
 			llmCalls++;
-			const stream = new MockAssistantStream();
+			const stream = createAssistantMessageEventStream();
 			queueMicrotask(() => {
 				if (llmCalls === 1) {
 					stream.push({
@@ -246,7 +238,7 @@ describe("parallel tool-call cap (PI_MAX_PARALLEL_TOOL_CALLS)", () => {
 		let llmCalls = 0;
 		const stream = agentLoop([createUserMessage("big batch")], context, config, undefined, () => {
 			llmCalls++;
-			const stream = new MockAssistantStream();
+			const stream = createAssistantMessageEventStream();
 			queueMicrotask(() => {
 				if (llmCalls === 1) {
 					stream.push({
@@ -321,7 +313,7 @@ describe("parallel tool-call cap (PI_MAX_PARALLEL_TOOL_CALLS)", () => {
 		let llmCalls = 0;
 		const stream = agentLoop([createUserMessage("cap me")], context, config, undefined, () => {
 			llmCalls++;
-			const stream = new MockAssistantStream();
+			const stream = createAssistantMessageEventStream();
 			queueMicrotask(() => {
 				if (llmCalls === 1) {
 					stream.push({
@@ -387,7 +379,7 @@ describe("parallel tool-call cap (PI_MAX_PARALLEL_TOOL_CALLS)", () => {
 		let llmCalls = 0;
 		const stream = agentLoop([createUserMessage("normal batch")], context, config, undefined, () => {
 			llmCalls++;
-			const stream = new MockAssistantStream();
+			const stream = createAssistantMessageEventStream();
 			queueMicrotask(() => {
 				if (llmCalls === 1) {
 					stream.push({

@@ -866,7 +866,9 @@ export class AgentSession {
 			// the projection.
 			if (this._exceedsCompactionThreshold(route.model, projection)) {
 				await this._runAutoCompaction("threshold", false);
-				({ previous, context } = await prepare());
+				// Refresh projection too: the guard below must see the POST-compaction
+				// context, or it would reject runs that compaction just fixed.
+				({ previous, context, projection } = await prepare());
 			}
 			this._enforceContextGuardBeforeRequest(route.model, projection);
 			return { ...previous, context, model: route.model, thinkingLevel: route.thinkingLevel };
